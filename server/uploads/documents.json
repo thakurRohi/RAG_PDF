@@ -1,0 +1,83 @@
+[
+  {
+    "id": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf-0",
+    "source": "Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "storedFilename": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "chunkIndex": 1,
+    "totalChunks": 9,
+    "text": "#Problem Statement: E-Commerce Product Multi-Filter Sidebar The Mission: Create the core browsing interface of a high-traffic marketplace store. The user needs to be able to sift through an extensive product inventory dataset simultaneously using three distinct, complex filtering criteria. Frontend UI & User Interaction: ● The Interactive Sidebar Layout: The left section of the viewport houses a sticky filter controls panel. It features: 1) A Category Checklist group (e.g., Electronics, Apparel, Footwear), 2) A dual-point Price Range Slider track allowing the user to select minimum and maximum bounds, and 3) A Minimum Star Rating set of radio selection buttons (1 to 5 stars). ● The Dynamic Product Inventory Grid: The main right-hand section displays matching products as cards containing an image thumbnail, price tag, star rating display, and item name. ● Instant State Feedback: Every single click or slider adjustment on the sidebar instantly updates the catalog grid without needing a m",
+    "uploadedAt": "2026-08-11T07:13:21.698Z"
+  },
+  {
+    "id": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf-1",
+    "source": "Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "storedFilename": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "chunkIndex": 2,
+    "totalChunks": 9,
+    "text": "and item name. ● Instant State Feedback: Every single click or slider adjustment on the sidebar instantly updates the catalog grid without needing a manual \"Submit\" button click. If the filters are tuned so tightly that zero items match, the catalog grid disappears and renders a \"No items match your criteria. Reset filters\" button screen. Backend Logic & State Management: ● Combinatorial Intersect Filtering Array: Write the core processing function that accepts the active combination criteria state. It executes a comprehensive search loop over the master product item inventory array, ensuring a product is only returned if it safely satisfies the category selection, falls inside the price boundary, and meets or exceeds the star rating. ● Graceful Null Handling: If all filters are left unselected or cleared, the logic safely bypasses data reduction filters to display the full, base inventory set seamlessly.",
+    "uploadedAt": "2026-08-11T07:13:21.698Z"
+  },
+  {
+    "id": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf-2",
+    "source": "Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "storedFilename": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "chunkIndex": 3,
+    "totalChunks": 9,
+    "text": "The Vibe Check: Add a \"Sort By\" Dropdown Menu component to the top right of the inventory grid containing choices like: Price: Low to High and Top Rated First. The candidate must refactor their logic loop so that the pipeline filters the original dataset first, and then arranges the visual presentation order of the remaining cards instantly based on the sorting state chosen.",
+    "uploadedAt": "2026-08-11T07:13:21.698Z"
+  },
+  {
+    "id": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf-3",
+    "source": "Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "storedFilename": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "chunkIndex": 4,
+    "totalChunks": 9,
+    "text": "#Candidate Guidelines: Please read the following instructions carefully before appearing for the assessment.",
+    "uploadedAt": "2026-08-11T07:13:21.698Z"
+  },
+  {
+    "id": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf-4",
+    "source": "Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "storedFilename": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "chunkIndex": 5,
+    "totalChunks": 9,
+    "text": "Assessment Details: ● The Vibe Coding Round will begin sharply at 10:00 AM and conclude at 11:40 AM. ● Candidates are expected to join the assessment platform (Unstop) 10 mins prior. ● Once the round begins, the detailed problem statement will be shared on Unstop. Proctoring & Setup Requirements: ● You must share your entire screen throughout the assessment. ● Your camera & mic must remain switched on for the complete duration of the round. ● Unstop will proctor the assessment throughout the session. ● Any suspicious activity, violation, or attempt to bypass proctoring guidelines may impact your score and candidature. Use of AI Tools ● Candidates are permitted to use any AI tool to complete. ● The evaluation will focus not only on the final solution but also on your understanding of the implementation during the subsequent Viva round.",
+    "uploadedAt": "2026-08-11T07:13:21.698Z"
+  },
+  {
+    "id": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf-5",
+    "source": "Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "storedFilename": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "chunkIndex": 6,
+    "totalChunks": 9,
+    "text": "[IMP] Submission Process: ● We suggest spending the first 5 mins understanding the problem statement. ● Plan your time effectively to ensure you have sufficient time to upload your solution to GitHub and complete the submission process before the deadline. ● Maintain meaningful and incremental Git commits that clearly reflect the functionality implemented at each stage of development. ● Follow a clean, scalable, and well-structured architecture for both the frontend and backend components of your solution. ● All business logic, calculations, validations, and computations should be implemented on the server side. The frontend should primarily handle presentation and user interactions. ● After uploading your code, submit the GitHub repository link on Unstop (Vibe Coding Submission). ● The GitHub link must be submitted no later than 11:40 AM (05 Aug).",
+    "uploadedAt": "2026-08-11T07:13:21.698Z"
+  },
+  {
+    "id": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf-6",
+    "source": "Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "storedFilename": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "chunkIndex": 7,
+    "totalChunks": 9,
+    "text": "● Any submission received after 11:40 AM will be automatically disqualified. ● We will verify GitHub commits and upload timestamps. Any edits, commits, or modifications made after 11:40 AM (05 Aug) will lead to disqualification. ● Ensure that the GitHub repository is publicly accessible for review. Restrictions: ● Mobile phones/Calculators or any other device is strictly prohibited. ● Do not connect headphones or any Bluetooth-enabled devices during the round. ● Please ensure that all system notifications, pop-ups, and distractions are disabled. ● External assistance from any individual is strictly prohibited. Viva Round: ● Candidates who submit their solutions will also participate in a Viva discussion based on the code they have submitted. ● Schedules for the Viva round will be shared after the round completion. Candidate’s Responsibility: ● A quiet, well-lit environment & a stable/reliable internet connection. ● A fully charged laptop and access to power backup if required. ● Suffic",
+    "uploadedAt": "2026-08-11T07:13:21.698Z"
+  },
+  {
+    "id": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf-7",
+    "source": "Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "storedFilename": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "chunkIndex": 8,
+    "totalChunks": 9,
+    "text": "ty: ● A quiet, well-lit environment & a stable/reliable internet connection. ● A fully charged laptop and access to power backup if required. ● Sufficient access to the AI tools you intend to use, including any token, usage, or subscription limits. Final Note ● No re-attempts or extensions will be provided under any circumstances. ● By participating in this round, you agree to adhere to the assessment guidelines and maintain the highest standards of integrity and professionalism.",
+    "uploadedAt": "2026-08-11T07:13:21.698Z"
+  },
+  {
+    "id": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf-8",
+    "source": "Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "storedFilename": "1786432401310-552900285-Off-Campus Vibe Coding _ Q __ CU.pdf",
+    "chunkIndex": 9,
+    "totalChunks": 9,
+    "text": "We wish you all the best for the Vibe Coding Round!",
+    "uploadedAt": "2026-08-11T07:13:21.698Z"
+  }
+]
