@@ -4,6 +4,10 @@ import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
 import pdfParse from 'pdf-parse';
+import dotenv from 'dotenv';
+import { MongoClient } from 'mongodb';
+
+dotenv.config();
 
 const app = express();
 app.use(cors());
@@ -14,6 +18,10 @@ const STORE_FILE = path.join(UPLOAD_DIR, 'documents.json');
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20MB
 const CHUNK_SIZE = 1000;
 const CHUNK_OVERLAP = 150;
+const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'pdf_rag';
+let mongoClient = null;
+let documentsCollection = null;
 
 if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -30,8 +38,59 @@ if (fs.existsSync(STORE_FILE)) {
   }
 }
 
-const saveDocuments = () => {
+const saveDocuments = async () => {
   fs.writeFileSync(STORE_FILE, JSON.stringify(documents, null, 2), 'utf-8');
+
+  if (!documentsCollection) return;
+
+  try {
+    await documentsCollection.deleteMany({});
+    if (documents.length) {
+      await documentsCollection.insertMany(documents);
+    }
+  } catch (error) {
+    console.error('Failed to sync documents to MongoDB:', error.message);
+  }
+};
+
+const connectMongo = async () => {
+  if (!MONGODB_URI) {
+    console.log('MONGODB_URI not found. Using local JSON document storage only.');
+    return false;
+  }
+
+  if (mongoClient) {
+    return true;
+  }
+
+  try {
+    mongoClient = new MongoClient(MONGODB_URI, {
+      serverSelectionTimeoutMS: 10000,
+    });
+    await mongoClient.connect();
+    const db = mongoClient.db(MONGODB_DB_NAME);
+    documentsCollection = db.collection('documents');
+    await documentsCollection.createIndex({ source: 1, uploadedAt: 1 });
+    console.log(`MongoDB connected successfully to database: ${MONGODB_DB_NAME}`);
+    return true;
+  } catch (error) {
+    console.error('MongoDB connection failed:', error.message);
+    mongoClient = null;
+    documentsCollection = null;
+    return false;
+  }
+};
+
+const loadDocumentsFromMongo = async () => {
+  if (!documentsCollection) return;
+
+  try {
+    const mongoDocuments = await documentsCollection.find({}).sort({ uploadedAt: 1 }).toArray();
+    documents = mongoDocuments.map((doc) => ({ ...doc, id: doc.id || `${doc.source}-${doc.chunkIndex}` }));
+    console.log(`Loaded ${documents.length} document chunks from MongoDB.`);
+  } catch (error) {
+    console.error('Failed to load documents from MongoDB:', error.message);
+  }
 };
 
 // ---------- Chunking ----------
@@ -197,7 +256,7 @@ app.post('/upload/pdf', upload.single('pdf'), async (req, res) => {
     }));
 
     documents = [...documents, ...newDocs];
-    saveDocuments();
+    await saveDocuments();
 
     res.json({
       message: 'uploaded',
@@ -212,7 +271,7 @@ app.post('/upload/pdf', upload.single('pdf'), async (req, res) => {
   }
 });
 
-app.delete('/documents/:source', (req, res) => {
+app.delete('/documents/:source', async (req, res) => {
   const source = decodeURIComponent(req.params.source);
   const toRemove = documents.filter((doc) => doc.source === source);
 
@@ -229,7 +288,7 @@ app.delete('/documents/:source', (req, res) => {
   }
 
   documents = documents.filter((doc) => doc.source !== source);
-  saveDocuments();
+  await saveDocuments();
 
   res.json({ message: 'deleted', source, remainingDocuments: documents.length });
 });
@@ -288,4 +347,17 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => console.log(`Server started on PORT:${PORT}`));
+
+const bootstrap = async () => {
+  await connectMongo();
+  if (documentsCollection) {
+    await loadDocumentsFromMongo();
+  }
+
+  app.listen(PORT, () => console.log(`Server started on PORT:${PORT}`));
+};
+
+bootstrap().catch((error) => {
+  console.error('Failed to start server:', error.message);
+  process.exit(1);
+});
