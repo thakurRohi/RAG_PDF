@@ -48,6 +48,21 @@ export interface ChatResponse {
   sources: ChatSource[];
 }
 
+export interface ChatHistoryMessage {
+  role: 'assistant' | 'user';
+  content: string;
+  sources?: ChatSource[];
+}
+
+export interface ChatConversation {
+  conversationId: string;
+  title: string;
+  selectedSources: string[];
+  hasMessages: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export const api = {
   listDocuments: () => request<{ documents: DocumentSummary[] }>('/documents'),
 
@@ -66,10 +81,33 @@ export const api = {
       { method: 'DELETE' }
     ),
 
-  chat: (message: string) =>
+  getChatHistory: (conversationId: string) =>
+    request<{ messages: ChatHistoryMessage[] }>(
+      `/chat/history/${encodeURIComponent(conversationId)}`
+    ),
+
+  listChats: () => request<{ chats: ChatConversation[] }>('/chats'),
+
+  createChat: () =>
+    request<{ chat: ChatConversation }>('/chats', { method: 'POST' }),
+
+  updateChat: (conversationId: string, selectedSources: string[]) =>
+    request<{ chat: ChatConversation }>(`/chats/${encodeURIComponent(conversationId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ selectedSources }),
+    }),
+
+  deleteChat: (conversationId: string) =>
+    request<{ message: string; conversationId: string }>(
+      `/chats/${encodeURIComponent(conversationId)}`,
+      { method: 'DELETE' }
+    ),
+
+  chat: (message: string, conversationId: string) =>
     request<ChatResponse>('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, conversationId }),
     }),
 };
