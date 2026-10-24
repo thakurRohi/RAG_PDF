@@ -3,7 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import pdfParse from 'pdf-parse';
 import dotenv from 'dotenv';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 
 dotenv.config();
 
@@ -19,6 +19,11 @@ const EMBEDDING_MODEL = 'gemini-embedding-001';
 const EMBEDDING_BATCH_SIZE = 100;
 const MAX_EMBEDDING_RETRIES = 1;
 const MAX_AUTOMATIC_RETRY_MS = 60_000;
+const EMBEDDING_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60;
+const RETRIEVAL_CACHE_TTL_SECONDS = 5 * 60;
+const ANSWER_CACHE_TTL_SECONDS = 24 * 60 * 60;
+const UPSTASH_REDIS_REST_URL = process.env.UPSTASH_REDIS_REST_URL?.replace(/\/+$/, '');
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const METADATA_VECTOR = Array.from(
   { length: EMBEDDING_DIMENSIONS },
   (_, index) => (index === 0 ? 1 : 0)
@@ -31,6 +36,12 @@ const QDRANT_URL = process.env.QDRANT_URL?.replace(/\/+$/, '');
 const QDRANT_API_KEY = process.env.QDRANT_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const CACHE_PREFIX = 'pdf-rag:v1';
+const cacheMetrics = {
+  embeddings: { hits: 0, misses: 0, writes: 0 },
+  retrieval: { hits: 0, misses: 0, writes: 0 },
+  answers: { hits: 0, misses: 0, writes: 0 },
+};
 
 class HttpError extends Error {
   constructor(statusCode, message) {
@@ -56,6 +67,91 @@ const qdrantRequest = async (endpoint, options = {}) => {
   }
 
   return body?.result;
+};
+
+const redisPipeline = async (commands) => {
+  const response = await fetch(`${UPSTASH_REDIS_REST_URL}/pipeline`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(commands),
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok || !Array.isArray(result)) {
+    throw new HttpError(503, `Upstash cache request failed (${response.status}).`);
+  }
+
+  const commandError = result.find((entry) => entry.error);
+  if (commandError) {
+    throw new HttpError(503, `Upstash cache command failed: ${commandError.error}`);
+  }
+  return result.map((entry) => entry.result);
+};
+
+const cacheGetMany = async (keys, category) => {
+  if (!keys.length) return [];
+  const values = await redisPipeline(keys.map((key) => ['GET', key]));
+  if (category && cacheMetrics[category]) {
+    for (const value of values) {
+      if (value === null || value === undefined) cacheMetrics[category].misses += 1;
+      else cacheMetrics[category].hits += 1;
+    }
+  }
+  return values.map((value) => value ?? null);
+};
+
+const cacheSetMany = async (entries, ttlSeconds, category, embeddingNamespace) => {
+  if (!entries.length) return;
+  const commands = entries.map(({ key, value }) => [
+    'SET',
+    key,
+    JSON.stringify(value),
+    'EX',
+    ttlSeconds,
+  ]);
+  if (embeddingNamespace) {
+    const registryKey = embeddingRegistryKey(embeddingNamespace);
+    commands.push(['SADD', registryKey, ...entries.map(({ key }) => key)]);
+    commands.push(['EXPIRE', registryKey, EMBEDDING_CACHE_TTL_SECONDS]);
+  }
+  await redisPipeline(commands);
+  if (category && cacheMetrics[category]) {
+    cacheMetrics[category].writes += entries.length;
+  }
+};
+
+const cacheDigest = (value) =>
+  createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+const embeddingRegistryKey = (namespace) =>
+  `${CACHE_PREFIX}:embedding-keys:${cacheDigest(namespace)}`;
+
+const deleteEmbeddingCacheForNamespace = async (namespace) => {
+  const registryKey = embeddingRegistryKey(namespace);
+  const [keys] = await redisPipeline([['SMEMBERS', registryKey]]);
+  const commands = [];
+  if (Array.isArray(keys) && keys.length) {
+    for (let start = 0; start < keys.length; start += 500) {
+      commands.push(['DEL', ...keys.slice(start, start + 500)]);
+    }
+  }
+  commands.push(['DEL', registryKey]);
+  await redisPipeline(commands);
+};
+
+const getDocumentGeneration = async () => {
+  const [generation] = await redisPipeline([['GET', `${CACHE_PREFIX}:document-generation`]]);
+  const parsed = Number(generation || 0);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new HttpError(503, 'Upstash returned an invalid document cache generation.');
+  }
+  return parsed;
+};
+
+const invalidateDocumentCaches = async () => {
+  await redisPipeline([['INCR', `${CACHE_PREFIX}:document-generation`]]);
 };
 
 const ensureCollection = async (collectionName) => {
@@ -133,11 +229,38 @@ const getRetryDelayMs = (response, result) => {
   return retryMessageSeconds ? Number(retryMessageSeconds) * 1000 : null;
 };
 
-const embedTexts = async (texts, taskType) => {
-  const embeddings = [];
+const embedTexts = async (texts, taskType, namespace = 'shared') => {
+  const keys = texts.map((text) =>
+    `${CACHE_PREFIX}:embedding:${cacheDigest([namespace, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, taskType, text])}`
+  );
+  const cached = await cacheGetMany(keys, 'embeddings');
+  const embeddings = new Array(texts.length);
+  const missing = [];
+  const missingKeys = [];
 
-  for (let start = 0; start < texts.length; start += EMBEDDING_BATCH_SIZE) {
-    const batch = texts.slice(start, start + EMBEDDING_BATCH_SIZE);
+  cached.forEach((value, index) => {
+    if (value === null) {
+      missing.push({ text: texts[index], index });
+      missingKeys.push(keys[index]);
+      return;
+    }
+    try {
+      embeddings[index] = JSON.parse(value);
+    } catch {
+      throw new HttpError(503, 'Upstash returned an invalid cached embedding.');
+    }
+    const vector = embeddings[index];
+    if (
+      !Array.isArray(vector) ||
+      vector.length !== EMBEDDING_DIMENSIONS ||
+      vector.some((item) => !Number.isFinite(item))
+    ) {
+      throw new HttpError(503, 'Upstash returned an invalid cached embedding.');
+    }
+  });
+
+  for (let start = 0; start < missing.length; start += EMBEDDING_BATCH_SIZE) {
+    const batch = missing.slice(start, start + EMBEDDING_BATCH_SIZE);
     let result;
     let retryCount = 0;
     while (true) {
@@ -150,7 +273,7 @@ const embedTexts = async (texts, taskType) => {
             'x-goog-api-key': GEMINI_API_KEY,
           },
           body: JSON.stringify({
-            requests: batch.map((text) => ({
+            requests: batch.map(({ text }) => ({
               model: `models/${EMBEDDING_MODEL}`,
               content: { parts: [{ text }] },
               taskType,
@@ -198,13 +321,53 @@ const embedTexts = async (texts, taskType) => {
       throw new HttpError(502, 'Gemini returned invalid embedding vectors.');
     }
 
-    embeddings.push(...batchEmbeddings);
+    const cacheEntries = [];
+    batch.forEach(({ index }, batchIndex) => {
+      embeddings[index] = batchEmbeddings[batchIndex];
+      cacheEntries.push({
+        key: keys[index],
+        value: batchEmbeddings[batchIndex],
+      });
+    });
+    await cacheSetMany(
+      cacheEntries,
+      EMBEDDING_CACHE_TTL_SECONDS,
+      'embeddings',
+      namespace
+    );
   }
 
   return embeddings;
 };
 
-const generateAnswer = async (query, documents, previousTurns) => {
+const generateAnswer = async (
+  query,
+  documents,
+  previousTurns,
+  selectedSources,
+  documentGeneration
+) => {
+  const answerCacheKey = `${CACHE_PREFIX}:answer:${cacheDigest([
+    GROQ_MODEL,
+    documentGeneration,
+    query,
+    [...selectedSources].sort(),
+    previousTurns,
+    documents.map(({ source, chunkIndex, text }) => ({ source, chunkIndex, text })),
+  ])}`;
+  const [cachedAnswer] = await cacheGetMany([answerCacheKey], 'answers');
+  if (cachedAnswer !== null) {
+    try {
+      const answer = JSON.parse(cachedAnswer);
+      if (typeof answer !== 'string' || !answer.trim()) {
+        throw new Error('Cached answer must be a non-empty string.');
+      }
+      return answer;
+    } catch {
+      throw new HttpError(503, 'Upstash returned an invalid cached answer.');
+    }
+  }
+
   const context = documents
     .map(
       (doc, index) =>
@@ -250,6 +413,11 @@ const generateAnswer = async (query, documents, previousTurns) => {
     throw new HttpError(502, 'Groq returned an empty answer.');
   }
 
+  await cacheSetMany(
+    [{ key: answerCacheKey, value: answer }],
+    ANSWER_CACHE_TTL_SECONDS,
+    'answers'
+  );
   return answer;
 };
 
@@ -265,47 +433,60 @@ const isConversationId = (value) =>
   typeof value === 'string' &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 
-const persistChatTurn = async (conversationId, queryVector, userMessage, response, conversation) => {
+const persistChatTurn = async (
+  conversationId,
+  queryVector,
+  userMessage,
+  response,
+  conversation,
+  previousTurns
+) => {
   const content = response.excerpt
     ? `${response.message}\n\n${response.excerpt}`
     : response.message;
 
-  await qdrantRequest(
-    `/collections/${encodeURIComponent(QDRANT_CHAT_COLLECTION)}/points`,
-    {
-      method: 'PUT',
-      body: JSON.stringify({
-        wait: true,
-        points: [{
-          id: randomUUID(),
-          vector: queryVector,
-          payload: {
-            recordType: 'turn',
-            conversationId,
-            userMessage,
-            assistantMessage: content,
-            sources: response.sources,
-            createdAt: new Date().toISOString(),
-          },
-        }],
-      }),
-    }
-  );
-
+  const createdAt = new Date().toISOString();
   const updatedAt = new Date().toISOString();
   const title = conversation.title === 'New chat'
     ? userMessage.replace(/\s+/g, ' ').trim().slice(0, 60) || 'New chat'
     : conversation.title;
-  await qdrantRequest(
-    `/collections/${encodeURIComponent(QDRANT_CHAT_COLLECTION)}/points/payload?wait=true`,
-    {
-      method: 'POST',
-      body: JSON.stringify({
-        points: [conversationId],
-        payload: { title, updatedAt, hasMessages: true },
-      }),
-    }
-  );
+  const turn = {
+    userMessage,
+    assistantMessage: content,
+    createdAt,
+  };
+  const recentTurns = [...previousTurns, turn].slice(-6);
+  await Promise.all([
+    qdrantRequest(
+      `/collections/${encodeURIComponent(QDRANT_CHAT_COLLECTION)}/points`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          wait: true,
+          points: [{
+            id: randomUUID(),
+            vector: queryVector,
+            payload: {
+              recordType: 'turn',
+              conversationId,
+              ...turn,
+              sources: response.sources,
+            },
+          }],
+        }),
+      }
+    ),
+    qdrantRequest(
+      `/collections/${encodeURIComponent(QDRANT_CHAT_COLLECTION)}/points/payload?wait=true`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          points: [conversationId],
+          payload: { title, updatedAt, hasMessages: true, recentTurns },
+        }),
+      }
+    ),
+  ]);
 };
 
 // ---------- Chunking ----------
@@ -352,6 +533,28 @@ const asyncHandler = (handler) => (req, res, next) =>
 // ---------- Routes ----------
 app.get('/', asyncHandler(async (req, res) => {
   res.json({ status: 'All Good!', uploadedDocuments: await getPointCount() });
+}));
+
+app.get('/health/cache', asyncHandler(async (req, res) => {
+  const [status] = await redisPipeline([['PING']]);
+  if (status !== 'PONG') {
+    throw new HttpError(503, 'Upstash Redis health check returned an unexpected response.');
+  }
+
+  res.json({
+    status: 'connected',
+    provider: 'Upstash Redis',
+    metrics: {
+      scope: 'This server process since startup; counters reset on restart.',
+      ...cacheMetrics,
+    },
+    storage: {
+      prefix: `${CACHE_PREFIX}:`,
+      embeddings: `JSON vectors; ${EMBEDDING_CACHE_TTL_SECONDS} seconds TTL`,
+      retrieval: `Retrieved chunk text and scores; ${RETRIEVAL_CACHE_TTL_SECONDS} seconds TTL`,
+      answers: `Generated answers; ${ANSWER_CACHE_TTL_SECONDS} seconds TTL`,
+    },
+  });
 }));
 
 app.get('/documents', asyncHandler(async (req, res) => {
@@ -636,7 +839,7 @@ app.post('/upload/pdf', upload.single('pdf'), asyncHandler(async (req, res) => {
   const uploadedAt = new Date().toISOString();
 
   try {
-    const vectors = await embedTexts(chunks, 'RETRIEVAL_DOCUMENT');
+    const vectors = await embedTexts(chunks, 'RETRIEVAL_DOCUMENT', source);
     await qdrantRequest(
       `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points`,
       {
@@ -657,6 +860,7 @@ app.post('/upload/pdf', upload.single('pdf'), asyncHandler(async (req, res) => {
         }),
       }
     );
+    await invalidateDocumentCaches();
   } catch (error) {
     console.error('Failed to embed or index PDF:', error.message);
     throw error;
@@ -697,6 +901,8 @@ app.delete('/documents/:source', asyncHandler(async (req, res) => {
       }),
     }
   );
+  await deleteEmbeddingCacheForNamespace(source);
+  await invalidateDocumentCaches();
 
   res.json({
     message: 'deleted',
@@ -720,33 +926,24 @@ const handleChat = asyncHandler(async (req, res) => {
     throw new HttpError(400, 'Select at least one PDF for this chat before sending a message.');
   }
 
-  const [queryVector] = await embedTexts([userQuery], 'RETRIEVAL_QUERY');
-  const result = await qdrantRequest(
-    `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/search`,
-    {
-      method: 'POST',
-      body: JSON.stringify({
-        vector: queryVector,
-        limit: 5,
-        with_payload: true,
-        filter: {
-          must: [{ key: 'source', match: { any: selectedSources } }],
-        },
-      }),
+  const [[queryVector], documentGeneration] = await Promise.all([
+    embedTexts([userQuery], 'RETRIEVAL_QUERY'),
+    getDocumentGeneration(),
+  ]);
+  const retrievalCacheKey = `${CACHE_PREFIX}:retrieval:${cacheDigest([
+    QDRANT_COLLECTION,
+    documentGeneration,
+    [...selectedSources].sort(),
+    queryVector,
+  ])}`;
+  const [cachedRetrieval] = await cacheGetMany([retrievalCacheKey], 'retrieval');
+  const loadRecentTurns = async () => {
+    if (Array.isArray(conversation.recentTurns)) {
+      return conversation.recentTurns
+        .filter((turn) => turn.userMessage && turn.assistantMessage)
+        .slice(-6);
     }
-  );
 
-  const scored = (result || []).map((point) => ({
-    ...point.payload,
-    score: point.score,
-  }));
-  let response;
-  if (!scored.length) {
-    response = {
-      message: "I couldn't find a relevant passage in the PDFs selected for this chat.",
-      sources: [],
-    };
-  } else {
     const historyResult = await qdrantRequest(
       `/collections/${encodeURIComponent(QDRANT_CHAT_COLLECTION)}/points/scroll`,
       {
@@ -761,14 +958,70 @@ const handleChat = asyncHandler(async (req, res) => {
         }),
       }
     );
-    const previousTurns = (historyResult?.points || [])
+    return (historyResult?.points || [])
       .map((point) => point.payload)
       .filter((turn) => turn.userMessage && turn.assistantMessage)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
       .slice(-6);
+  };
 
+  let scored;
+  let previousTurns;
+  if (cachedRetrieval !== null) {
+    try {
+      scored = JSON.parse(cachedRetrieval);
+    } catch {
+      throw new HttpError(503, 'Upstash returned invalid cached search results.');
+    }
+    if (!Array.isArray(scored)) {
+      throw new HttpError(503, 'Upstash returned invalid cached search results.');
+    }
+    previousTurns = await loadRecentTurns();
+  } else {
+    const [result, recentTurns] = await Promise.all([
+      qdrantRequest(
+        `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/search`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            vector: queryVector,
+            limit: 5,
+            with_payload: true,
+            filter: {
+              must: [{ key: 'source', match: { any: selectedSources } }],
+            },
+          }),
+        }
+      ),
+      loadRecentTurns(),
+    ]);
+
+    scored = (result || []).map((point) => ({
+      ...point.payload,
+      score: point.score,
+    }));
+    previousTurns = recentTurns;
+    await cacheSetMany(
+      [{ key: retrievalCacheKey, value: scored }],
+      RETRIEVAL_CACHE_TTL_SECONDS,
+      'retrieval'
+    );
+  }
+  let response;
+  if (!scored.length) {
     response = {
-      message: await generateAnswer(userQuery, scored, previousTurns),
+      message: "I couldn't find a relevant passage in the PDFs selected for this chat.",
+      sources: [],
+    };
+  } else {
+    response = {
+      message: await generateAnswer(
+        userQuery,
+        scored,
+        previousTurns,
+        selectedSources,
+        documentGeneration
+      ),
       sources: scored.map((doc) => ({
         source: doc.source,
         chunkIndex: doc.chunkIndex,
@@ -778,7 +1031,14 @@ const handleChat = asyncHandler(async (req, res) => {
     };
   }
 
-  await persistChatTurn(conversationId, queryVector, userQuery, response, conversation);
+  await persistChatTurn(
+    conversationId,
+    queryVector,
+    userQuery,
+    response,
+    conversation,
+    previousTurns
+  );
   res.json(response);
 });
 
@@ -800,6 +1060,8 @@ const bootstrap = async () => {
     !GROQ_API_KEY && 'GROQ_API_KEY',
     !QDRANT_URL && 'QDRANT_URL',
     !QDRANT_API_KEY && 'QDRANT_API_KEY',
+    !UPSTASH_REDIS_REST_URL && 'UPSTASH_REDIS_REST_URL',
+    !UPSTASH_REDIS_REST_TOKEN && 'UPSTASH_REDIS_REST_TOKEN',
   ].filter(Boolean);
   if (missing.length) {
     throw new Error(`Missing required online service configuration: ${missing.join(', ')}`);
@@ -810,6 +1072,11 @@ const bootstrap = async () => {
   await ensurePayloadIndex(QDRANT_COLLECTION, 'source');
   await ensurePayloadIndex(QDRANT_CHAT_COLLECTION, 'conversationId');
   await ensurePayloadIndex(QDRANT_CHAT_COLLECTION, 'recordType');
+  const [cacheStatus] = await redisPipeline([['PING']]);
+  if (cacheStatus !== 'PONG') {
+    throw new Error('Upstash Redis did not respond to PING.');
+  }
+  console.log('Upstash Redis cache connected.');
   app.listen(PORT, () => console.log(`Server started on PORT:${PORT}`));
 };
 

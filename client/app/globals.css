@@ -32,46 +32,36 @@
   --radius-xl: calc(var(--radius) + 4px);
 }
 
-/*
-  Design system — "Reading Room"
-  A single warm-neutral surface with one deliberate accent (deep pine ink),
-  used consistently everywhere: no secondary accent colors, no per-component
-  palettes. Geist Sans carries conversation, Geist Mono carries document
-  metadata (sources, chunk indices) to visually separate "what the app says"
-  from "what the document says".
-*/
 :root {
-  --radius: 0.75rem;
+  --radius: 0.9rem;
 
-  --background: oklch(0.975 0.004 90);
-  --foreground: oklch(0.22 0.012 90);
+  --background: oklch(0.16 0.012 260);
+  --foreground: oklch(0.94 0.008 260);
 
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.22 0.012 90);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.22 0.012 90);
+  --card: oklch(0.205 0.014 260);
+  --card-foreground: oklch(0.94 0.008 260);
+  --popover: oklch(0.23 0.016 260);
+  --popover-foreground: oklch(0.94 0.008 260);
 
-  /* Accent: deep pine ink — the single brand color, used for primary
-     actions, the user's chat bubble, and citation chips. */
-  --primary: oklch(0.4 0.06 165);
-  --primary-foreground: oklch(0.98 0.006 165);
-  --primary-soft: oklch(0.94 0.03 165);
+  --primary: oklch(0.72 0.14 165);
+  --primary-foreground: oklch(0.17 0.02 165);
+  --primary-soft: oklch(0.29 0.045 165);
 
-  --secondary: oklch(0.95 0.005 90);
-  --secondary-foreground: oklch(0.22 0.012 90);
+  --secondary: oklch(0.255 0.016 260);
+  --secondary-foreground: oklch(0.92 0.008 260);
 
-  --muted: oklch(0.95 0.005 90);
-  --muted-foreground: oklch(0.5 0.012 90);
+  --muted: oklch(0.255 0.016 260);
+  --muted-foreground: oklch(0.69 0.014 260);
 
-  --accent: var(--primary-soft);
-  --accent-foreground: var(--primary);
+  --accent: oklch(0.29 0.045 165);
+  --accent-foreground: oklch(0.82 0.1 165);
 
-  --destructive: oklch(0.5 0.16 25);
-  --destructive-foreground: oklch(0.98 0.006 25);
+  --destructive: oklch(0.68 0.19 25);
+  --destructive-foreground: oklch(0.22 0.03 25);
 
-  --border: oklch(0.89 0.008 90);
-  --input: oklch(0.89 0.008 90);
-  --ring: oklch(0.4 0.06 165 / 40%);
+  --border: oklch(0.32 0.016 260);
+  --input: oklch(0.32 0.016 260);
+  --ring: oklch(0.72 0.14 165 / 45%);
 }
 
 @layer base {
@@ -80,5 +70,15 @@
   }
   body {
     @apply bg-background text-foreground;
+    background-image: radial-gradient(ellipse at 65% -20%, oklch(0.27 0.045 165 / 25%), transparent 55%);
+    background-attachment: fixed;
+  }
+  ::selection {
+    background: oklch(0.55 0.12 165 / 40%);
+    color: oklch(0.98 0.006 165);
+  }
+  * {
+    scrollbar-color: oklch(0.38 0.018 260) transparent;
+    scrollbar-width: thin;
   }
 }

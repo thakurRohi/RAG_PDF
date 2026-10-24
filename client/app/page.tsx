@@ -86,7 +86,7 @@ export default function Home() {
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background">
-      <div className="w-[320px] shrink-0">
+      <div className="w-[42vw] max-w-[320px] shrink-0">
         <LibraryPanel
           documents={documents}
           onDocumentsChange={setDocuments}
