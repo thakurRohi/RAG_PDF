@@ -1,7 +1,7 @@
 'use client';
 
 import * as React from 'react';
-import { ArrowUp, FileSearch, Loader2, MessageCircle } from 'lucide-react';
+import { ArrowUp, FileSearch, Loader2, MessageCircle, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import {
@@ -23,6 +23,8 @@ interface ChatComponentProps {
   conversation: ChatConversation | null;
   isChatsLoaded: boolean;
   onConversationChange: (chat: ChatConversation) => void;
+  isSidebarOpen: boolean;
+  onToggleSidebar: () => void;
 }
 
 const SourceChip: React.FC<{ source: ChatSource }> = ({ source }) => (
@@ -41,6 +43,8 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
   conversation,
   isChatsLoaded,
   onConversationChange,
+  isSidebarOpen,
+  onToggleSidebar,
 }) => {
   const [message, setMessage] = React.useState('');
   const [messages, setMessages] = React.useState<IMessage[]>([]);
@@ -174,15 +178,31 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col">
       <header className="flex min-h-16 items-center justify-between gap-4 border-b border-border px-6 py-3">
-        <div className="min-w-0">
-          <h2 className="truncate text-sm font-semibold tracking-tight">
-            {conversation?.title || 'PDF Chat'}
-          </h2>
-          <p className="text-xs text-muted-foreground">
-            {conversation
-              ? 'This chat only searches its selected PDFs'
-              : 'Create a chat and choose the PDFs it can use'}
-          </p>
+        <div className="flex min-w-0 items-center gap-3">
+          <button
+            type="button"
+            onClick={onToggleSidebar}
+            aria-label={isSidebarOpen ? 'Hide sidebar' : 'Show sidebar and PDF upload'}
+            title={isSidebarOpen ? 'Hide sidebar' : 'Show sidebar and PDF upload'}
+            aria-expanded={isSidebarOpen}
+            className="shrink-0 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {isSidebarOpen ? (
+              <PanelLeftClose className="size-4" aria-hidden="true" />
+            ) : (
+              <PanelLeftOpen className="size-4" aria-hidden="true" />
+            )}
+          </button>
+          <div className="min-w-0">
+            <h2 className="truncate text-sm font-semibold tracking-tight">
+              {conversation?.title || 'PDF Chat'}
+            </h2>
+            <p className="text-xs text-muted-foreground">
+              {conversation
+                ? 'This chat only searches its selected PDFs'
+                : 'Create a chat and choose the PDFs it can use'}
+            </p>
+          </div>
         </div>
         {conversation && (
           <details className="group relative shrink-0">

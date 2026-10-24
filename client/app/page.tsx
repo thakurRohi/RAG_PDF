@@ -11,6 +11,7 @@ export default function Home() {
   const [activeChatId, setActiveChatId] = React.useState<string | null>(null);
   const [chatsLoaded, setChatsLoaded] = React.useState(false);
   const [chatsError, setChatsError] = React.useState<string | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = React.useState(true);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -62,7 +63,7 @@ export default function Home() {
     );
   };
 
-  const handleDeleteChat = async (conversationId: string) => {
+  const handleDeleteChat = async (conversationId: string): Promise<boolean> => {
     setChatsError(null);
     try {
       await api.deleteChat(conversationId);
@@ -77,8 +78,10 @@ export default function Home() {
           window.localStorage.removeItem('pdf-rag-active-chat-id');
         }
       }
+      return true;
     } catch (error) {
       setChatsError(error instanceof Error ? error.message : 'Could not delete this chat.');
+      return false;
     }
   };
 
@@ -86,7 +89,13 @@ export default function Home() {
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background">
-      <div className="w-[42vw] max-w-[320px] shrink-0">
+      <div
+        className={`shrink-0 overflow-hidden transition-[width] duration-200 ease-in-out ${
+          isSidebarOpen ? 'w-[42vw] max-w-[320px]' : 'w-0 max-w-0'
+        }`}
+        aria-hidden={!isSidebarOpen}
+        inert={!isSidebarOpen}
+      >
         <LibraryPanel
           documents={documents}
           onDocumentsChange={setDocuments}
@@ -103,6 +112,8 @@ export default function Home() {
         conversation={activeChat}
         isChatsLoaded={chatsLoaded}
         onConversationChange={handleChatChange}
+        isSidebarOpen={isSidebarOpen}
+        onToggleSidebar={() => setIsSidebarOpen((open) => !open)}
       />
     </div>
   );
