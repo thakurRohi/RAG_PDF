@@ -6,13 +6,17 @@ PDFs/chunks to local files.
 
 ## Online setup
 
-1. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/),
-   a Groq API key in [Groq Console](https://console.groq.com/keys), and a
-   free-tier cluster in [Qdrant Cloud](https://cloud.qdrant.io/). Free quotas
-   and availability are controlled by those providers and can change.
+1. Create a Jina API key from [Jina](https://jina.ai/embeddings/), a Gemini API
+   key in [Google AI Studio](https://aistudio.google.com/) for embedding
+   fallback, a Groq API key in [Groq Console](https://console.groq.com/keys),
+   and a free-tier cluster in [Qdrant Cloud](https://cloud.qdrant.io/). Free
+   quotas and availability are controlled by those providers and can change.
 2. Create a free Redis database in [Upstash](https://console.upstash.com/).
-   Copy `server/.env.example` to `server/.env` and fill in the Gemini and Groq
-   API keys, Qdrant cluster URL/API key, and Upstash REST URL/token.
+   Copy `server/.env.example` to `server/.env` and fill in the Jina and Gemini
+   embedding keys (Gemini is optional but recommended as a fallback), Groq
+   key, Qdrant cluster URL/API key, and Upstash REST URL/token. Jina is used
+   for embeddings when `JINA_API_KEY` is configured; Gemini remains an
+   automatic fallback when Jina requests fail.
    In Upstash, open the database's **Connect** page and copy the REST URL and
    REST token into `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
    `GROQ_MODEL` defaults to
@@ -26,20 +30,39 @@ PDFs/chunks to local files.
    Development uses Webpack and a separate `.next-dev` output directory so
    Windows dev manifests do not contend with the production build output.
 
-The server parses each uploaded PDF in memory, sends its text chunks to Gemini
+## Deploying the client to Vercel and the server to Render
+
+- In Render, configure the web service with the repository's `server` root
+  directory, `npm install` as the build command, and `npm start` as the start
+  command. Add the variables from `server/.env.example` in the Render
+  dashboard; the local `server/.env` file is not deployed. Use Render's
+  assigned `PORT`.
+- Deploy the latest backend revision. Check that `GET /chats` and
+  `GET /health/cache` on the Render service no longer return 404; `/chats`
+  should return JSON. A 404 on either route means the deployed server does not
+  have the current API routes.
+- In Vercel, set `NEXT_PUBLIC_API_URL` to the Render service's base URL only
+  (for example, `https://your-service.onrender.com`, with no `/api` path).
+  Set it for each relevant environment and redeploy the client after changing
+  it, since the value is included during the Next.js build.
+
+The server parses each uploaded PDF in memory, sends its text chunks to Jina
 for embeddings, and stores the text and vectors in Qdrant Cloud. Questions are
-embedded by Gemini and searched in Qdrant; Groq generates a natural-language
-answer using the retrieved passages. Groq is used for answer generation, not
-embeddings, so the Gemini key is still required. PDF files are not retained by
-the server; extracted text and questions are sent to the configured providers.
-The service requires the cloud credentials above and intentionally does not
-fall back to local storage.
+embedded by the same provider and searched in Qdrant; Gemini is retained as an
+automatic fallback for embedding requests, and Groq generates a
+natural-language answer using the retrieved passages. `JINA_API_KEY` or
+`GEMINI_API_KEY` is required. PDF files are not retained by the server;
+extracted text and questions are sent to the configured providers. The service
+requires the cloud credentials above and intentionally does not fall back to
+local storage.
 
 Gemini embedding requests are retried once when Google returns a short
-rate-limit delay. Creating chats does not call Gemini; only PDF indexing and
-user-question searches need embeddings. The free-tier quota still applies, so
-large PDFs or repeated uploads may need to wait for the provider's quota window
-to reset.
+rate-limit delay. Creating chats does not call an embedding provider; only PDF
+indexing and user-question searches need embeddings. Existing Gemini-indexed
+PDF chunks (including older chunks without provider metadata) remain searchable
+with Gemini; re-upload them to index them with Jina. The server filters
+retrieval by embedding provider to avoid comparing vectors from different
+models.
 
 Upstash Redis caches embeddings (keyed by model, task, and text hash),
 retrieval results (keyed by query vector, selected PDFs, and document

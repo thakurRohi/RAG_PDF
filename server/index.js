@@ -15,7 +15,8 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const CHUNK_SIZE = 1000;
 const CHUNK_OVERLAP = 150;
 const EMBEDDING_DIMENSIONS = 768;
-const EMBEDDING_MODEL = 'gemini-embedding-001';
+const JINA_EMBEDDING_MODEL = 'jina-embeddings-v3';
+const GEMINI_EMBEDDING_MODEL = 'gemini-embedding-001';
 const EMBEDDING_BATCH_SIZE = 100;
 const MAX_EMBEDDING_RETRIES = 1;
 const MAX_AUTOMATIC_RETRY_MS = 60_000;
@@ -34,6 +35,7 @@ const QDRANT_CHAT_COLLECTION =
   process.env.QDRANT_CHAT_COLLECTION || `${QDRANT_COLLECTION}_chat_history`;
 const QDRANT_URL = process.env.QDRANT_URL?.replace(/\/+$/, '');
 const QDRANT_API_KEY = process.env.QDRANT_API_KEY;
+const JINA_API_KEY = process.env.JINA_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const CACHE_PREFIX = 'pdf-rag:v1';
@@ -49,6 +51,8 @@ class HttpError extends Error {
     this.statusCode = statusCode;
   }
 }
+
+class EmbeddingProviderError extends HttpError {}
 
 const qdrantRequest = async (endpoint, options = {}) => {
   const response = await fetch(`${QDRANT_URL}${endpoint}`, {
@@ -229,9 +233,136 @@ const getRetryDelayMs = (response, result) => {
   return retryMessageSeconds ? Number(retryMessageSeconds) * 1000 : null;
 };
 
-const embedTexts = async (texts, taskType, namespace = 'shared') => {
+const requestJinaEmbeddings = async (batch, taskType) => {
+  let response;
+  try {
+    response = await fetch('https://api.jina.ai/v1/embeddings', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${JINA_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: JINA_EMBEDDING_MODEL,
+        input: batch.map(({ text }) => text),
+        task: taskType === 'RETRIEVAL_QUERY' ? 'retrieval.query' : 'retrieval.passage',
+        dimensions: EMBEDDING_DIMENSIONS,
+        embedding_type: 'float',
+      }),
+    });
+  } catch (error) {
+    throw new EmbeddingProviderError(502, `Jina embedding request failed: ${error.message}`);
+  }
+
+  const result = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = result?.detail || result?.message || response.statusText;
+    throw new EmbeddingProviderError(
+      response.status === 429 ? 429 : 502,
+      `Jina embedding request failed (${response.status}): ${detail}`
+    );
+  }
+
+  const data = result?.data;
+  if (
+    !Array.isArray(data) ||
+    data.length !== batch.length ||
+    data.some(
+      (item) =>
+        !item ||
+        !Number.isInteger(item.index) ||
+        item.index < 0 ||
+        item.index >= batch.length ||
+        !Array.isArray(item.embedding) ||
+        item.embedding.length !== EMBEDDING_DIMENSIONS ||
+        item.embedding.some((value) => !Number.isFinite(value))
+    )
+  ) {
+    throw new EmbeddingProviderError(502, 'Jina returned invalid embedding vectors.');
+  }
+
+  if (new Set(data.map((item) => item.index)).size !== batch.length) {
+    throw new EmbeddingProviderError(502, 'Jina returned invalid embedding vectors.');
+  }
+
+  return [...data]
+    .sort((left, right) => left.index - right.index)
+    .map((item) => item.embedding);
+};
+
+const requestGeminiEmbeddings = async (batch, taskType) => {
+  let result;
+  let retryCount = 0;
+  while (true) {
+    let response;
+    try {
+      response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_EMBEDDING_MODEL}:batchEmbedContents`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': GEMINI_API_KEY,
+          },
+          body: JSON.stringify({
+            requests: batch.map(({ text }) => ({
+              model: `models/${GEMINI_EMBEDDING_MODEL}`,
+              content: { parts: [{ text }] },
+              taskType,
+              outputDimensionality: EMBEDDING_DIMENSIONS,
+            })),
+          }),
+        }
+      );
+    } catch (error) {
+      throw new EmbeddingProviderError(502, `Gemini embedding request failed: ${error.message}`);
+    }
+    result = await response.json().catch(() => null);
+
+    if (response.ok) break;
+
+    const detail = result?.error?.message || response.statusText;
+    const retryDelayMs = response.status === 429 ? getRetryDelayMs(response, result) : null;
+    if (response.status === 429 && retryCount < MAX_EMBEDDING_RETRIES) {
+      const waitMs = retryDelayMs ?? 2000;
+      if (waitMs <= MAX_AUTOMATIC_RETRY_MS) {
+        console.warn(`Gemini embedding quota reached; retrying after ${Math.ceil(waitMs / 1000)}s.`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        retryCount += 1;
+        continue;
+      }
+    }
+
+    const retryAdvice = retryDelayMs === null
+      ? 'Wait before trying again or check your Gemini API quota.'
+      : `Try again in about ${Math.ceil(retryDelayMs / 1000)} seconds.`;
+    throw new EmbeddingProviderError(
+      response.status === 429 ? 429 : 502,
+      `Gemini embedding request failed (${response.status}): ${detail} ${retryAdvice}`
+    );
+  }
+
+  const vectors = result?.embeddings?.map((item) => item.values);
+  if (
+    !Array.isArray(vectors) ||
+    vectors.length !== batch.length ||
+    vectors.some(
+      (vector) =>
+        !Array.isArray(vector) ||
+        vector.length !== EMBEDDING_DIMENSIONS ||
+        vector.some((value) => !Number.isFinite(value))
+    )
+  ) {
+    throw new EmbeddingProviderError(502, 'Gemini returned invalid embedding vectors.');
+  }
+
+  return vectors;
+};
+
+const embedWithProvider = async (texts, taskType, namespace, provider) => {
+  const model = provider === 'jina' ? JINA_EMBEDDING_MODEL : GEMINI_EMBEDDING_MODEL;
   const keys = texts.map((text) =>
-    `${CACHE_PREFIX}:embedding:${cacheDigest([namespace, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, taskType, text])}`
+    `${CACHE_PREFIX}:embedding:${cacheDigest([namespace, provider, model, EMBEDDING_DIMENSIONS, taskType, text])}`
   );
   const cached = await cacheGetMany(keys, 'embeddings');
   const embeddings = new Array(texts.length);
@@ -261,65 +392,9 @@ const embedTexts = async (texts, taskType, namespace = 'shared') => {
 
   for (let start = 0; start < missing.length; start += EMBEDDING_BATCH_SIZE) {
     const batch = missing.slice(start, start + EMBEDDING_BATCH_SIZE);
-    let result;
-    let retryCount = 0;
-    while (true) {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:batchEmbedContents`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': GEMINI_API_KEY,
-          },
-          body: JSON.stringify({
-            requests: batch.map(({ text }) => ({
-              model: `models/${EMBEDDING_MODEL}`,
-              content: { parts: [{ text }] },
-              taskType,
-              outputDimensionality: EMBEDDING_DIMENSIONS,
-            })),
-          }),
-        }
-      );
-      result = await response.json().catch(() => null);
-
-      if (response.ok) break;
-
-      const detail = result?.error?.message || response.statusText;
-      const retryDelayMs = response.status === 429 ? getRetryDelayMs(response, result) : null;
-      if (response.status === 429 && retryCount < MAX_EMBEDDING_RETRIES) {
-        const waitMs = retryDelayMs ?? 2000;
-        if (waitMs <= MAX_AUTOMATIC_RETRY_MS) {
-          console.warn(`Gemini embedding quota reached; retrying after ${Math.ceil(waitMs / 1000)}s.`);
-          await new Promise((resolve) => setTimeout(resolve, waitMs));
-          retryCount += 1;
-          continue;
-        }
-      }
-
-      const retryAdvice = retryDelayMs === null
-        ? 'Wait before trying again or check your Gemini API quota.'
-        : `Try again in about ${Math.ceil(retryDelayMs / 1000)} seconds.`;
-      throw new HttpError(
-        response.status === 429 ? 429 : 502,
-        `Gemini embedding request failed (${response.status}): ${detail} ${retryAdvice}`
-      );
-    }
-
-    const batchEmbeddings = result?.embeddings?.map((item) => item.values);
-    if (
-      !Array.isArray(batchEmbeddings) ||
-      batchEmbeddings.length !== batch.length ||
-      batchEmbeddings.some(
-        (vector) =>
-          !Array.isArray(vector) ||
-          vector.length !== EMBEDDING_DIMENSIONS ||
-          vector.some((value) => !Number.isFinite(value))
-      )
-    ) {
-      throw new HttpError(502, 'Gemini returned invalid embedding vectors.');
-    }
+    const batchEmbeddings = provider === 'jina'
+      ? await requestJinaEmbeddings(batch, taskType)
+      : await requestGeminiEmbeddings(batch, taskType);
 
     const cacheEntries = [];
     batch.forEach(({ index }, batchIndex) => {
@@ -337,7 +412,35 @@ const embedTexts = async (texts, taskType, namespace = 'shared') => {
     );
   }
 
-  return embeddings;
+  return { vectors: embeddings, provider };
+};
+
+const embedTexts = async (
+  texts,
+  taskType,
+  namespace = 'shared',
+  preferredProvider = JINA_API_KEY ? 'jina' : 'gemini'
+) => {
+  const primaryKey = preferredProvider === 'jina' ? JINA_API_KEY : GEMINI_API_KEY;
+  const fallbackProvider = preferredProvider === 'jina' ? 'gemini' : 'jina';
+  const fallbackKey = fallbackProvider === 'jina' ? JINA_API_KEY : GEMINI_API_KEY;
+
+  if (primaryKey) {
+    try {
+      return await embedWithProvider(texts, taskType, namespace, preferredProvider);
+    } catch (error) {
+      if (!(error instanceof EmbeddingProviderError) || !fallbackKey) throw error;
+      console.warn(
+        `${preferredProvider === 'jina' ? 'Jina' : 'Gemini'} embeddings unavailable; falling back to ${fallbackProvider}: ${error.message}`
+      );
+      return embedWithProvider(texts, taskType, namespace, fallbackProvider);
+    }
+  }
+
+  throw new HttpError(
+    503,
+    `${preferredProvider === 'jina' ? 'JINA_API_KEY' : 'GEMINI_API_KEY'} is required to search this document's embeddings.`
+  );
 };
 
 const generateAnswer = async (
@@ -839,7 +942,7 @@ app.post('/upload/pdf', upload.single('pdf'), asyncHandler(async (req, res) => {
   const uploadedAt = new Date().toISOString();
 
   try {
-    const vectors = await embedTexts(chunks, 'RETRIEVAL_DOCUMENT', source);
+    const { vectors, provider } = await embedTexts(chunks, 'RETRIEVAL_DOCUMENT', source);
     await qdrantRequest(
       `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points`,
       {
@@ -851,6 +954,7 @@ app.post('/upload/pdf', upload.single('pdf'), asyncHandler(async (req, res) => {
             vector: vectors[index],
             payload: {
               source,
+              embeddingProvider: provider,
               chunkIndex: index + 1,
               totalChunks: chunks.length,
               text,
@@ -926,12 +1030,30 @@ const handleChat = asyncHandler(async (req, res) => {
     throw new HttpError(400, 'Select at least one PDF for this chat before sending a message.');
   }
 
-  const [[queryVector], documentGeneration] = await Promise.all([
-    embedTexts([userQuery], 'RETRIEVAL_QUERY'),
+  const jinaDocumentCount = await qdrantRequest(
+    `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/count`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        exact: true,
+        filter: {
+          must: [
+            { key: 'source', match: { any: selectedSources } },
+            { key: 'embeddingProvider', match: { value: 'jina' } },
+          ],
+        },
+      }),
+    }
+  );
+  const preferredProvider = jinaDocumentCount?.count ? 'jina' : 'gemini';
+
+  const [{ vectors: [queryVector], provider }, documentGeneration] = await Promise.all([
+    embedTexts([userQuery], 'RETRIEVAL_QUERY', 'shared', preferredProvider),
     getDocumentGeneration(),
   ]);
   const retrievalCacheKey = `${CACHE_PREFIX}:retrieval:${cacheDigest([
     QDRANT_COLLECTION,
+    provider,
     documentGeneration,
     [...selectedSources].sort(),
     queryVector,
@@ -989,6 +1111,16 @@ const handleChat = asyncHandler(async (req, res) => {
             with_payload: true,
             filter: {
               must: [{ key: 'source', match: { any: selectedSources } }],
+              ...(provider === 'gemini'
+                ? {
+                    should: [
+                      { key: 'embeddingProvider', match: { value: 'gemini' } },
+                      { is_empty: { key: 'embeddingProvider' } },
+                    ],
+                  }
+                : {
+                    must: [{ key: 'embeddingProvider', match: { value: 'jina' } }],
+                  }),
             },
           }),
         }
@@ -1056,7 +1188,7 @@ const PORT = process.env.PORT || 8000;
 
 const bootstrap = async () => {
   const missing = [
-    !GEMINI_API_KEY && 'GEMINI_API_KEY',
+    !JINA_API_KEY && !GEMINI_API_KEY && 'JINA_API_KEY or GEMINI_API_KEY',
     !GROQ_API_KEY && 'GROQ_API_KEY',
     !QDRANT_URL && 'QDRANT_URL',
     !QDRANT_API_KEY && 'QDRANT_API_KEY',
@@ -1070,6 +1202,7 @@ const bootstrap = async () => {
   await ensureCollection(QDRANT_COLLECTION);
   await ensureCollection(QDRANT_CHAT_COLLECTION);
   await ensurePayloadIndex(QDRANT_COLLECTION, 'source');
+  await ensurePayloadIndex(QDRANT_COLLECTION, 'embeddingProvider');
   await ensurePayloadIndex(QDRANT_CHAT_COLLECTION, 'conversationId');
   await ensurePayloadIndex(QDRANT_CHAT_COLLECTION, 'recordType');
   const [cacheStatus] = await redisPipeline([['PING']]);
