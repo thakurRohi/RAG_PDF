@@ -4,27 +4,80 @@ import * as React from 'react';
 import LibraryPanel from './components/file-upload';
 import ChatComponent from './components/chat';
 import { api, type ChatConversation, type DocumentSummary } from '@/lib/api';
+import SignIn from './components/sign-in';
+import { getSupabaseClient } from '@/lib/supabase';
+import type { Session } from '@supabase/supabase-js';
 
 export default function Home() {
+  const [session, setSession] = React.useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = React.useState(true);
+  const [authError, setAuthError] = React.useState<string | null>(null);
   const [documents, setDocuments] = React.useState<DocumentSummary[]>([]);
   const [chats, setChats] = React.useState<ChatConversation[]>([]);
   const [activeChatId, setActiveChatId] = React.useState<string | null>(null);
   const [chatsLoaded, setChatsLoaded] = React.useState(false);
   const [chatsError, setChatsError] = React.useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = React.useState(true);
+  const activeChatStorageKey = session
+    ? `pdf-rag-active-chat-id:${session.user.id}`
+    : null;
 
   React.useEffect(() => {
+    let cancelled = false;
+    let receivedAuthEvent = false;
+    let subscription: { unsubscribe: () => void } | undefined;
+
+    const initializeAuth = async () => {
+      try {
+        const supabase = getSupabaseClient();
+        subscription = supabase.auth.onAuthStateChange((_event, nextSession) => {
+          receivedAuthEvent = true;
+          setSession(nextSession);
+          setAuthError(null);
+          setAuthLoading(false);
+        }).data.subscription;
+        const { data, error } = await supabase.auth.getSession();
+        if (error) throw error;
+        if (!cancelled && !receivedAuthEvent) setSession(data.session);
+      } catch (error) {
+        if (!cancelled) {
+          setAuthError(error instanceof Error ? error.message : 'Could not initialize sign-in.');
+        }
+      } finally {
+        if (!cancelled) setAuthLoading(false);
+      }
+    };
+
+    void initializeAuth();
+    return () => {
+      cancelled = true;
+      subscription?.unsubscribe();
+    };
+  }, []);
+
+  React.useEffect(() => {
+    if (!session) {
+      setChatsLoaded(false);
+      setChats([]);
+      setDocuments([]);
+      setActiveChatId(null);
+      return;
+    }
     let cancelled = false;
     api.listChats()
       .then(({ chats: savedChats }) => {
         if (cancelled) return;
         setChats(savedChats);
-        const savedActiveId = window.localStorage.getItem('pdf-rag-active-chat-id');
+        const savedActiveId = activeChatStorageKey
+          ? window.localStorage.getItem(activeChatStorageKey)
+          : null;
         const selectedChat = savedChats.find((chat) => chat.conversationId === savedActiveId)
           || savedChats[0];
         if (selectedChat) {
           setActiveChatId(selectedChat.conversationId);
-          window.localStorage.setItem('pdf-rag-active-chat-id', selectedChat.conversationId);
+          if (activeChatStorageKey) {
+            window.localStorage.setItem(activeChatStorageKey, selectedChat.conversationId);
+          }
         }
         setChatsLoaded(true);
       })
@@ -36,7 +89,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [session?.user.id, activeChatStorageKey]);
 
   const handleNewChat = async () => {
     setChatsError(null);
@@ -44,7 +97,9 @@ export default function Home() {
       const { chat } = await api.createChat();
       setChats((current) => [chat, ...current]);
       setActiveChatId(chat.conversationId);
-      window.localStorage.setItem('pdf-rag-active-chat-id', chat.conversationId);
+      if (activeChatStorageKey) {
+        window.localStorage.setItem(activeChatStorageKey, chat.conversationId);
+      }
     } catch (error) {
       setChatsError(error instanceof Error ? error.message : 'Could not create a chat.');
     }
@@ -52,7 +107,9 @@ export default function Home() {
 
   const handleSelectChat = (conversationId: string) => {
     setActiveChatId(conversationId);
-    window.localStorage.setItem('pdf-rag-active-chat-id', conversationId);
+    if (activeChatStorageKey) {
+      window.localStorage.setItem(activeChatStorageKey, conversationId);
+    }
   };
 
   const handleChatChange = (updatedChat: ChatConversation) => {
@@ -73,9 +130,11 @@ export default function Home() {
         const nextChat = remainingChats[0] || null;
         setActiveChatId(nextChat?.conversationId || null);
         if (nextChat) {
-          window.localStorage.setItem('pdf-rag-active-chat-id', nextChat.conversationId);
+          if (activeChatStorageKey) {
+            window.localStorage.setItem(activeChatStorageKey, nextChat.conversationId);
+          }
         } else {
-          window.localStorage.removeItem('pdf-rag-active-chat-id');
+          if (activeChatStorageKey) window.localStorage.removeItem(activeChatStorageKey);
         }
       }
       return true;
@@ -84,6 +143,25 @@ export default function Home() {
       return false;
     }
   };
+
+  const handleSignOut = async () => {
+    try {
+      const { error } = await getSupabaseClient().auth.signOut();
+      if (error) throw error;
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Could not sign out.');
+    }
+  };
+
+  if (authLoading) {
+    return (
+      <main className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">
+        Checking your sign-in…
+      </main>
+    );
+  }
+
+  if (!session) return <SignIn initialError={authError} />;
 
   const activeChat = chats.find((chat) => chat.conversationId === activeChatId) || null;
 
@@ -100,11 +178,14 @@ export default function Home() {
           documents={documents}
           onDocumentsChange={setDocuments}
           chats={chats}
+          userEmail={session.user.email || ''}
+          authError={authError}
           activeChatId={activeChatId}
           chatsError={chatsError}
           onSelectChat={handleSelectChat}
           onNewChat={handleNewChat}
           onDeleteChat={handleDeleteChat}
+          onSignOut={handleSignOut}
         />
       </div>
       <ChatComponent

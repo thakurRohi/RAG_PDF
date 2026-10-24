@@ -1,3 +1,5 @@
+import { getSupabaseClient } from './supabase';
+
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export class ApiError extends Error {
@@ -9,9 +11,16 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const { data, error } = await getSupabaseClient().auth.getSession();
+  if (error) throw new ApiError(`Could not read your sign-in session: ${error.message}`, 401);
+  const accessToken = data.session?.access_token;
+  if (!accessToken) throw new ApiError('Sign in to continue.', 401);
+
+  const headers = new Headers(init?.headers);
+  headers.set('Authorization', `Bearer ${accessToken}`);
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}${path}`, init);
+    res = await fetch(`${API_BASE}${path}`, { ...init, headers });
   } catch {
     throw new ApiError(
       'Could not reach the server. Is it running on port 8000?',

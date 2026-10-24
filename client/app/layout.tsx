@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: 'Reading Room — PDF Q&A',
-  description: 'Upload PDFs and ask questions about them, running entirely locally.',
+  description: 'Sign in securely to upload PDFs and ask questions about them.',
 };
 
 export default function RootLayout({

@@ -6,17 +6,28 @@ PDFs/chunks to local files.
 
 ## Online setup
 
-1. Create a Jina API key from [Jina](https://jina.ai/embeddings/), a Gemini API
+1. Create a project in [Supabase](https://supabase.com/), then enable Google in
+   **Authentication → Sign In / Providers**. Configure Google's OAuth client
+   with the callback URL shown by Supabase. In Supabase **Authentication → URL
+   Configuration**, set the local site URL to `http://localhost:3000` and add
+   `http://localhost:3000/auth/callback` to the allowed redirect URLs. Add the
+   production app URL and its `/auth/callback` URL before deploying.
+2. Create a Jina API key from [Jina](https://jina.ai/embeddings/), a Gemini API
    key in [Google AI Studio](https://aistudio.google.com/) for embedding
    fallback, a Groq API key in [Groq Console](https://console.groq.com/keys),
    and a free-tier cluster in [Qdrant Cloud](https://cloud.qdrant.io/). Free
    quotas and availability are controlled by those providers and can change.
-2. Create a free Redis database in [Upstash](https://console.upstash.com/).
-   Copy `server/.env.example` to `server/.env` and fill in the Jina and Gemini
-   embedding keys (Gemini is optional but recommended as a fallback), Groq
-   key, Qdrant cluster URL/API key, and Upstash REST URL/token. Jina is used
-   for embeddings when `JINA_API_KEY` is configured; Gemini remains an
-   automatic fallback when Jina requests fail.
+3. Create a free Redis database in [Upstash](https://console.upstash.com/).
+   Copy `server/.env.example` to `server/.env` and set `SUPABASE_URL` and
+   `SUPABASE_ANON_KEY` from the Supabase project's API settings, as well as
+   the Jina and Gemini embedding keys (Gemini is optional but recommended as
+   a fallback), Groq key, Qdrant cluster URL/API key, and Upstash REST
+   URL/token. Set `NEXT_PUBLIC_SUPABASE_URL` and
+   `NEXT_PUBLIC_SUPABASE_ANON_KEY` to the same Supabase project values in
+   `client/.env.local.example` copied to `client/.env.local`. The anon/publishable
+   key is intended for client use; never put a Supabase service-role key in the
+   client. Jina is used for embeddings when `JINA_API_KEY` is configured;
+   Gemini remains an automatic fallback when Jina requests fail.
    In Upstash, open the database's **Connect** page and copy the REST URL and
    REST token into `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
    `GROQ_MODEL` defaults to
@@ -24,7 +35,7 @@ PDFs/chunks to local files.
    [Models page](https://console.groq.com/docs/models). `QDRANT_COLLECTION` can
    stay as `pdf_chunks`. The server creates the collection with 768-dimensional
    cosine vectors if it does not exist.
-3. Configure `NEXT_PUBLIC_API_URL` in `client/.env.local` to point to the
+4. Configure `NEXT_PUBLIC_API_URL` in `client/.env.local` to point to the
    deployed server URL (or use `http://localhost:8000` when running the app
    locally). Start the server and client using their `npm run dev` scripts.
    Development uses Webpack and a separate `.next-dev` output directory so
@@ -35,16 +46,19 @@ PDFs/chunks to local files.
 - In Render, configure the web service with the repository's `server` root
   directory, `npm install` as the build command, and `npm start` as the start
   command. Add the variables from `server/.env.example` in the Render
-  dashboard; the local `server/.env` file is not deployed. Use Render's
-  assigned `PORT`.
+  dashboard, including `SUPABASE_URL` and `SUPABASE_ANON_KEY`; the local
+  `server/.env` file is not deployed. Use Render's assigned `PORT`.
 - Deploy the latest backend revision. Check that `GET /chats` and
   `GET /health/cache` on the Render service no longer return 404; `/chats`
   should return JSON. A 404 on either route means the deployed server does not
   have the current API routes.
 - In Vercel, set `NEXT_PUBLIC_API_URL` to the Render service's base URL only
   (for example, `https://your-service.onrender.com`, with no `/api` path).
-  Set it for each relevant environment and redeploy the client after changing
-  it, since the value is included during the Next.js build.
+  Also set `NEXT_PUBLIC_SUPABASE_URL` and
+  `NEXT_PUBLIC_SUPABASE_ANON_KEY` for each relevant environment. Add the
+  Vercel app URL and its `/auth/callback` URL to the Supabase allowed redirect
+  URLs, then redeploy the client after changing environment variables, since
+  these values are included during the Next.js build.
 
 The server parses each uploaded PDF in memory, sends its text chunks to Jina
 for embeddings, and stores the text and vectors in Qdrant Cloud. Questions are
@@ -55,6 +69,14 @@ natural-language answer using the retrieved passages. `JINA_API_KEY` or
 extracted text and questions are sent to the configured providers. The service
 requires the cloud credentials above and intentionally does not fall back to
 local storage.
+
+Users sign in with Google through Supabase Auth. The server verifies Supabase
+access tokens and scopes PDF chunks, chat records, searches, and deletions to
+the authenticated user; a client-supplied user ID is never trusted. Existing
+Qdrant records created before authentication have no owner association, so they
+are not visible to signed-in accounts. Back them up or remove them from Qdrant
+before enabling this version; assign legacy records only if you can establish
+their rightful owner.
 
 Gemini embedding requests are retried once when Google returns a short
 rate-limit delay. Creating chats does not call an embedding provider; only PDF
@@ -88,5 +110,6 @@ locked so follow-up questions cannot pull context from a different PDF set.
 Vector searches are filtered to only those selected PDFs. Chat turns and chat
 metadata are stored in a separate Qdrant collection
 (`pdf_chunks_chat_history` by default), while the browser stores only the
-currently selected conversation ID. Existing deployments create the required
+currently selected conversation ID in a per-account browser-storage key.
+Existing deployments create the required
 collection and payload indexes automatically when the server restarts.

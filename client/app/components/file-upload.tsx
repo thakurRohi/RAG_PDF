@@ -10,11 +10,14 @@ interface LibraryPanelProps {
   documents: DocumentSummary[];
   onDocumentsChange: (docs: DocumentSummary[]) => void;
   chats: ChatConversation[];
+  userEmail: string;
+  authError: string | null;
   activeChatId: string | null;
   chatsError: string | null;
   onSelectChat: (conversationId: string) => void;
   onNewChat: () => void;
   onDeleteChat: (conversationId: string) => Promise<boolean>;
+  onSignOut: () => void;
 }
 
 const formatBytesFriendlyName = (name: string) => {
@@ -26,11 +29,14 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
   documents,
   onDocumentsChange,
   chats,
+  userEmail,
+  authError,
   activeChatId,
   chatsError,
   onSelectChat,
   onNewChat,
   onDeleteChat,
+  onSignOut,
 }) => {
   const inputRef = React.useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = React.useState(false);
@@ -122,8 +128,25 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
           <p className="mt-1 text-sm text-muted-foreground">
             Upload PDFs, then ask questions about them.
           </p>
+          <p className="mt-2 max-w-44 truncate text-xs text-muted-foreground" title={userEmail}>
+            Signed in as {userEmail}
+          </p>
+          {authError && (
+            <p role="alert" className="mt-2 max-w-48 text-xs text-destructive">
+              {authError}
+            </p>
+          )}
         </div>
-        <ThemeToggle />
+        <div className="flex shrink-0 flex-col items-end gap-2">
+          <ThemeToggle />
+          <button
+            type="button"
+            onClick={onSignOut}
+            className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-secondary hover:text-foreground"
+          >
+            Sign out
+          </button>
+        </div>
       </div>
 
       <div className="shrink-0 px-5">

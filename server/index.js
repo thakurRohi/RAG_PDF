@@ -4,6 +4,7 @@ import multer from 'multer';
 import pdfParse from 'pdf-parse';
 import dotenv from 'dotenv';
 import { createHash, randomUUID } from 'crypto';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
@@ -35,10 +36,17 @@ const QDRANT_CHAT_COLLECTION =
   process.env.QDRANT_CHAT_COLLECTION || `${QDRANT_COLLECTION}_chat_history`;
 const QDRANT_URL = process.env.QDRANT_URL?.replace(/\/+$/, '');
 const QDRANT_API_KEY = process.env.QDRANT_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const JINA_API_KEY = process.env.JINA_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const CACHE_PREFIX = 'pdf-rag:v1';
+const supabaseAuth = SUPABASE_URL && SUPABASE_ANON_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    })
+  : null;
 const cacheMetrics = {
   embeddings: { hits: 0, misses: 0, writes: 0 },
   retrieval: { hits: 0, misses: 0, writes: 0 },
@@ -448,10 +456,12 @@ const generateAnswer = async (
   documents,
   previousTurns,
   selectedSources,
-  documentGeneration
+  documentGeneration,
+  ownerId
 ) => {
   const answerCacheKey = `${CACHE_PREFIX}:answer:${cacheDigest([
     GROQ_MODEL,
+    ownerId,
     documentGeneration,
     query,
     [...selectedSources].sort(),
@@ -524,10 +534,16 @@ const generateAnswer = async (
   return answer;
 };
 
-const getPointCount = async () => {
+const getPointCount = async (ownerId) => {
   const result = await qdrantRequest(
     `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/count`,
-    { method: 'POST', body: JSON.stringify({ exact: true }) }
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        exact: true,
+        filter: { must: [{ key: 'ownerId', match: { value: ownerId } }] },
+      }),
+    }
   );
   return result?.count ?? 0;
 };
@@ -542,7 +558,8 @@ const persistChatTurn = async (
   userMessage,
   response,
   conversation,
-  previousTurns
+  previousTurns,
+  ownerId
 ) => {
   const content = response.excerpt
     ? `${response.message}\n\n${response.excerpt}`
@@ -572,6 +589,7 @@ const persistChatTurn = async (
             payload: {
               recordType: 'turn',
               conversationId,
+              ownerId,
               ...turn,
               sources: response.sources,
             },
@@ -585,7 +603,7 @@ const persistChatTurn = async (
         method: 'POST',
         body: JSON.stringify({
           points: [conversationId],
-          payload: { title, updatedAt, hasMessages: true, recentTurns },
+          payload: { ownerId, title, updatedAt, hasMessages: true, recentTurns },
         }),
       }
     ),
@@ -633,9 +651,23 @@ const upload = multer({
 const asyncHandler = (handler) => (req, res, next) =>
   Promise.resolve(handler(req, res, next)).catch(next);
 
+const requireAuth = asyncHandler(async (req, res, next) => {
+  const authorization = req.headers.authorization || '';
+  const token = authorization.startsWith('Bearer ')
+    ? authorization.slice('Bearer '.length).trim()
+    : '';
+  if (!token) throw new HttpError(401, 'Sign in to continue.');
+  if (!supabaseAuth) throw new HttpError(503, 'Authentication is not configured.');
+
+  const { data, error } = await supabaseAuth.auth.getUser(token);
+  if (error || !data.user) throw new HttpError(401, 'Your session is invalid or expired. Sign in again.');
+  req.userId = data.user.id;
+  next();
+});
+
 // ---------- Routes ----------
 app.get('/', asyncHandler(async (req, res) => {
-  res.json({ status: 'All Good!', uploadedDocuments: await getPointCount() });
+  res.json({ status: 'All Good!' });
 }));
 
 app.get('/health/cache', asyncHandler(async (req, res) => {
@@ -660,6 +692,8 @@ app.get('/health/cache', asyncHandler(async (req, res) => {
   });
 }));
 
+app.use(requireAuth);
+
 app.get('/documents', asyncHandler(async (req, res) => {
   const documents = new Map();
   let offset;
@@ -673,6 +707,7 @@ app.get('/documents', asyncHandler(async (req, res) => {
           limit: 1000,
           with_payload: ['source', 'uploadedAt'],
           with_vectors: false,
+          filter: { must: [{ key: 'ownerId', match: { value: req.userId } }] },
           ...(offset !== undefined ? { offset } : {}),
         }),
       }
@@ -695,7 +730,7 @@ app.get('/documents', asyncHandler(async (req, res) => {
   res.json({ documents: Array.from(documents.values()) });
 }));
 
-const getConversation = async (conversationId) => {
+const getConversation = async (conversationId, userId) => {
   const result = await qdrantRequest(
     `/collections/${encodeURIComponent(QDRANT_CHAT_COLLECTION)}/points/scroll`,
     {
@@ -708,6 +743,7 @@ const getConversation = async (conversationId) => {
           must: [
             { key: 'recordType', match: { value: 'conversation' } },
             { key: 'conversationId', match: { value: conversationId } },
+            { key: 'ownerId', match: { value: userId } },
           ],
         },
       }),
@@ -730,7 +766,12 @@ app.get('/chats', asyncHandler(async (req, res) => {
           limit: 1000,
           with_payload: true,
           with_vectors: false,
-          filter: { must: [{ key: 'recordType', match: { value: 'conversation' } }] },
+          filter: {
+            must: [
+              { key: 'recordType', match: { value: 'conversation' } },
+              { key: 'ownerId', match: { value: req.userId } },
+            ],
+          },
           ...(offset !== undefined ? { offset } : {}),
         }),
       }
@@ -748,6 +789,7 @@ app.post('/chats', asyncHandler(async (req, res) => {
   const now = new Date().toISOString();
   const chat = {
     conversationId,
+    ownerId: req.userId,
     recordType: 'conversation',
     title: 'New chat',
     selectedSources: [],
@@ -775,7 +817,7 @@ app.patch('/chats/:conversationId', asyncHandler(async (req, res) => {
     throw new HttpError(400, 'Invalid conversation ID.');
   }
 
-  const conversation = await getConversation(conversationId);
+  const conversation = await getConversation(conversationId, req.userId);
   const selectedSources = req.body?.selectedSources;
   if (
     !Array.isArray(selectedSources) ||
@@ -795,6 +837,7 @@ app.patch('/chats/:conversationId', asyncHandler(async (req, res) => {
             must: [
               { key: 'recordType', match: { value: 'turn' } },
               { key: 'conversationId', match: { value: conversationId } },
+              { key: 'ownerId', match: { value: req.userId } },
             ],
           },
         }),
@@ -816,7 +859,12 @@ app.patch('/chats/:conversationId', asyncHandler(async (req, res) => {
         method: 'POST',
         body: JSON.stringify({
           exact: true,
-          filter: { must: [{ key: 'source', match: { value: source } }] },
+          filter: {
+            must: [
+              { key: 'source', match: { value: source } },
+              { key: 'ownerId', match: { value: req.userId } },
+            ],
+          },
         }),
       }
     );
@@ -846,7 +894,7 @@ app.delete('/chats/:conversationId', asyncHandler(async (req, res) => {
   if (!isConversationId(conversationId)) {
     throw new HttpError(400, 'Invalid conversation ID.');
   }
-  await getConversation(conversationId);
+  await getConversation(conversationId, req.userId);
   await qdrantRequest(
     `/collections/${encodeURIComponent(QDRANT_CHAT_COLLECTION)}/points/delete`,
     {
@@ -854,7 +902,10 @@ app.delete('/chats/:conversationId', asyncHandler(async (req, res) => {
       body: JSON.stringify({
         wait: true,
         filter: {
-          must: [{ key: 'conversationId', match: { value: conversationId } }],
+          must: [
+            { key: 'conversationId', match: { value: conversationId } },
+            { key: 'ownerId', match: { value: req.userId } },
+          ],
         },
       }),
     }
@@ -867,7 +918,7 @@ app.get('/chat/history/:conversationId', asyncHandler(async (req, res) => {
   if (!isConversationId(conversationId)) {
     throw new HttpError(400, 'Invalid conversation ID.');
   }
-  await getConversation(conversationId);
+  await getConversation(conversationId, req.userId);
 
   const turns = [];
   let offset;
@@ -886,7 +937,10 @@ app.get('/chat/history/:conversationId', asyncHandler(async (req, res) => {
           ],
           with_vectors: false,
           filter: {
-            must: [{ key: 'conversationId', match: { value: conversationId } }],
+            must: [
+              { key: 'conversationId', match: { value: conversationId } },
+              { key: 'ownerId', match: { value: req.userId } },
+            ],
           },
           ...(offset !== undefined ? { offset } : {}),
         }),
@@ -940,9 +994,14 @@ app.post('/upload/pdf', upload.single('pdf'), asyncHandler(async (req, res) => {
   const chunks = splitTextIntoChunks(data.text);
   const source = req.file.originalname;
   const uploadedAt = new Date().toISOString();
+  const embeddingNamespace = `${req.userId}:${source}`;
 
   try {
-    const { vectors, provider } = await embedTexts(chunks, 'RETRIEVAL_DOCUMENT', source);
+    const { vectors, provider } = await embedTexts(
+      chunks,
+      'RETRIEVAL_DOCUMENT',
+      embeddingNamespace
+    );
     await qdrantRequest(
       `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points`,
       {
@@ -954,6 +1013,7 @@ app.post('/upload/pdf', upload.single('pdf'), asyncHandler(async (req, res) => {
             vector: vectors[index],
             payload: {
               source,
+              ownerId: req.userId,
               embeddingProvider: provider,
               chunkIndex: index + 1,
               totalChunks: chunks.length,
@@ -974,7 +1034,7 @@ app.post('/upload/pdf', upload.single('pdf'), asyncHandler(async (req, res) => {
     message: 'uploaded',
     source,
     chunks: chunks.length,
-    totalDocuments: await getPointCount(),
+    totalDocuments: await getPointCount(req.userId),
   });
 }));
 
@@ -986,7 +1046,12 @@ app.delete('/documents/:source', asyncHandler(async (req, res) => {
       method: 'POST',
       body: JSON.stringify({
         exact: true,
-        filter: { must: [{ key: 'source', match: { value: source } }] },
+        filter: {
+          must: [
+            { key: 'source', match: { value: source } },
+            { key: 'ownerId', match: { value: req.userId } },
+          ],
+        },
       }),
     }
   );
@@ -1001,17 +1066,22 @@ app.delete('/documents/:source', asyncHandler(async (req, res) => {
       method: 'POST',
       body: JSON.stringify({
         wait: true,
-        filter: { must: [{ key: 'source', match: { value: source } }] },
+        filter: {
+          must: [
+            { key: 'source', match: { value: source } },
+            { key: 'ownerId', match: { value: req.userId } },
+          ],
+        },
       }),
     }
   );
-  await deleteEmbeddingCacheForNamespace(source);
+  await deleteEmbeddingCacheForNamespace(`${req.userId}:${source}`);
   await invalidateDocumentCaches();
 
   res.json({
     message: 'deleted',
     source,
-    remainingDocuments: await getPointCount(),
+    remainingDocuments: await getPointCount(req.userId),
   });
 }));
 
@@ -1024,7 +1094,7 @@ const handleChat = asyncHandler(async (req, res) => {
   if (!isConversationId(conversationId)) {
     throw new HttpError(400, 'Invalid conversation ID.');
   }
-  const conversation = await getConversation(conversationId);
+  const conversation = await getConversation(conversationId, req.userId);
   const selectedSources = conversation.selectedSources || [];
   if (!selectedSources.length) {
     throw new HttpError(400, 'Select at least one PDF for this chat before sending a message.');
@@ -1040,6 +1110,7 @@ const handleChat = asyncHandler(async (req, res) => {
           must: [
             { key: 'source', match: { any: selectedSources } },
             { key: 'embeddingProvider', match: { value: 'jina' } },
+            { key: 'ownerId', match: { value: req.userId } },
           ],
         },
       }),
@@ -1048,12 +1119,13 @@ const handleChat = asyncHandler(async (req, res) => {
   const preferredProvider = jinaDocumentCount?.count ? 'jina' : 'gemini';
 
   const [{ vectors: [queryVector], provider }, documentGeneration] = await Promise.all([
-    embedTexts([userQuery], 'RETRIEVAL_QUERY', 'shared', preferredProvider),
+    embedTexts([userQuery], 'RETRIEVAL_QUERY', req.userId, preferredProvider),
     getDocumentGeneration(),
   ]);
   const retrievalCacheKey = `${CACHE_PREFIX}:retrieval:${cacheDigest([
     QDRANT_COLLECTION,
     provider,
+    req.userId,
     documentGeneration,
     [...selectedSources].sort(),
     queryVector,
@@ -1075,7 +1147,10 @@ const handleChat = asyncHandler(async (req, res) => {
           with_payload: ['userMessage', 'assistantMessage', 'createdAt'],
           with_vectors: false,
           filter: {
-            must: [{ key: 'conversationId', match: { value: conversationId } }],
+            must: [
+              { key: 'conversationId', match: { value: conversationId } },
+              { key: 'ownerId', match: { value: req.userId } },
+            ],
           },
         }),
       }
@@ -1110,7 +1185,13 @@ const handleChat = asyncHandler(async (req, res) => {
             limit: 5,
             with_payload: true,
             filter: {
-              must: [{ key: 'source', match: { any: selectedSources } }],
+              must: [
+                { key: 'source', match: { any: selectedSources } },
+                { key: 'ownerId', match: { value: req.userId } },
+                ...(provider === 'jina'
+                  ? [{ key: 'embeddingProvider', match: { value: 'jina' } }]
+                  : []),
+              ],
               ...(provider === 'gemini'
                 ? {
                     should: [
@@ -1118,9 +1199,7 @@ const handleChat = asyncHandler(async (req, res) => {
                       { is_empty: { key: 'embeddingProvider' } },
                     ],
                   }
-                : {
-                    must: [{ key: 'embeddingProvider', match: { value: 'jina' } }],
-                  }),
+                : {}),
             },
           }),
         }
@@ -1152,7 +1231,8 @@ const handleChat = asyncHandler(async (req, res) => {
         scored,
         previousTurns,
         selectedSources,
-        documentGeneration
+        documentGeneration,
+        req.userId
       ),
       sources: scored.map((doc) => ({
         source: doc.source,
@@ -1169,7 +1249,8 @@ const handleChat = asyncHandler(async (req, res) => {
     userQuery,
     response,
     conversation,
-    previousTurns
+    previousTurns,
+    req.userId
   );
   res.json(response);
 });
@@ -1189,6 +1270,8 @@ const PORT = process.env.PORT || 8000;
 const bootstrap = async () => {
   const missing = [
     !JINA_API_KEY && !GEMINI_API_KEY && 'JINA_API_KEY or GEMINI_API_KEY',
+    !SUPABASE_URL && 'SUPABASE_URL',
+    !SUPABASE_ANON_KEY && 'SUPABASE_ANON_KEY',
     !GROQ_API_KEY && 'GROQ_API_KEY',
     !QDRANT_URL && 'QDRANT_URL',
     !QDRANT_API_KEY && 'QDRANT_API_KEY',
@@ -1203,8 +1286,10 @@ const bootstrap = async () => {
   await ensureCollection(QDRANT_CHAT_COLLECTION);
   await ensurePayloadIndex(QDRANT_COLLECTION, 'source');
   await ensurePayloadIndex(QDRANT_COLLECTION, 'embeddingProvider');
+  await ensurePayloadIndex(QDRANT_COLLECTION, 'ownerId');
   await ensurePayloadIndex(QDRANT_CHAT_COLLECTION, 'conversationId');
   await ensurePayloadIndex(QDRANT_CHAT_COLLECTION, 'recordType');
+  await ensurePayloadIndex(QDRANT_CHAT_COLLECTION, 'ownerId');
   const [cacheStatus] = await redisPipeline([['PING']]);
   if (cacheStatus !== 'PONG') {
     throw new Error('Upstash Redis did not respond to PING.');
