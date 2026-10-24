@@ -1,11 +1,9 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
-import fs from 'fs';
-import path from 'path';
 import pdfParse from 'pdf-parse';
 import dotenv from 'dotenv';
-import { MongoClient } from 'mongodb';
+import { randomUUID } from 'crypto';
 
 dotenv.config();
 
@@ -13,90 +11,133 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const UPLOAD_DIR = path.join(process.cwd(), 'uploads');
-const STORE_FILE = path.join(UPLOAD_DIR, 'documents.json');
-const MAX_UPLOAD_BYTES = 20 * 1024 * 1024; // 20MB
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const CHUNK_SIZE = 1000;
 const CHUNK_OVERLAP = 150;
-const MONGODB_URI = process.env.MONGODB_URI;
-const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'pdf_rag';
-let mongoClient = null;
-let documentsCollection = null;
+const EMBEDDING_DIMENSIONS = 768;
+const EMBEDDING_MODEL = 'gemini-embedding-001';
+const EMBEDDING_BATCH_SIZE = 100;
+const QDRANT_COLLECTION = process.env.QDRANT_COLLECTION || 'pdf_chunks';
+const QDRANT_URL = process.env.QDRANT_URL?.replace(/\/+$/, '');
+const QDRANT_API_KEY = process.env.QDRANT_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
-
-let documents = [];
-if (fs.existsSync(STORE_FILE)) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(STORE_FILE, 'utf-8'));
-    documents = Array.isArray(parsed) ? parsed : [];
-  } catch (error) {
-    console.error('Failed to read document store, starting fresh:', error.message);
-    documents = [];
+class HttpError extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.statusCode = statusCode;
   }
 }
 
-const saveDocuments = async () => {
-  fs.writeFileSync(STORE_FILE, JSON.stringify(documents, null, 2), 'utf-8');
+const qdrantRequest = async (endpoint, options = {}) => {
+  const response = await fetch(`${QDRANT_URL}${endpoint}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      'api-key': QDRANT_API_KEY,
+      ...options.headers,
+    },
+  });
+  const body = await response.json().catch(() => null);
 
-  if (!documentsCollection) return;
-
-  try {
-    await documentsCollection.deleteMany({});
-    if (documents.length) {
-      await documentsCollection.insertMany(documents);
-    }
-  } catch (error) {
-    console.error('Failed to sync documents to MongoDB:', error.message);
+  if (!response.ok) {
+    const detail = body?.status?.error || body?.status || response.statusText;
+    throw new HttpError(503, `Qdrant request failed (${response.status}): ${detail}`);
   }
+
+  return body?.result;
 };
 
-const connectMongo = async () => {
-  if (!MONGODB_URI) {
-    console.log('MONGODB_URI not found. Using local JSON document storage only.');
-    return false;
-  }
+const ensureCollection = async () => {
+  const endpoint = `/collections/${encodeURIComponent(QDRANT_COLLECTION)}`;
+  const response = await fetch(`${QDRANT_URL}${endpoint}`, {
+    headers: { 'api-key': QDRANT_API_KEY },
+  });
 
-  if (mongoClient) {
-    return true;
-  }
-
-  try {
-    mongoClient = new MongoClient(MONGODB_URI, {
-      serverSelectionTimeoutMS: 10000,
+  if (response.status === 404) {
+    await qdrantRequest(endpoint, {
+      method: 'PUT',
+      body: JSON.stringify({
+        vectors: { size: EMBEDDING_DIMENSIONS, distance: 'Cosine' },
+      }),
     });
-    await mongoClient.connect();
-    const db = mongoClient.db(MONGODB_DB_NAME);
-    documentsCollection = db.collection('documents');
-    await documentsCollection.createIndex({ source: 1, uploadedAt: 1 });
-    console.log(`MongoDB connected successfully to database: ${MONGODB_DB_NAME}`);
-    return true;
-  } catch (error) {
-    console.error('MongoDB connection failed:', error.message);
-    mongoClient = null;
-    documentsCollection = null;
-    return false;
+    console.log(`Created Qdrant collection: ${QDRANT_COLLECTION}`);
+    return;
+  }
+
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = body?.status?.error || body?.status || response.statusText;
+    throw new Error(`Could not inspect Qdrant collection (${response.status}): ${detail}`);
+  }
+
+  const size = body?.result?.config?.params?.vectors?.size;
+  if (size !== EMBEDDING_DIMENSIONS) {
+    throw new Error(
+      `Qdrant collection "${QDRANT_COLLECTION}" must use ${EMBEDDING_DIMENSIONS}-dimension vectors; found ${size ?? 'an incompatible vector configuration'}.`
+    );
   }
 };
 
-const loadDocumentsFromMongo = async () => {
-  if (!documentsCollection) return;
+const embedTexts = async (texts, taskType) => {
+  const embeddings = [];
 
-  try {
-    const mongoDocuments = await documentsCollection.find({}).sort({ uploadedAt: 1 }).toArray();
-    documents = mongoDocuments.map((doc) => ({ ...doc, id: doc.id || `${doc.source}-${doc.chunkIndex}` }));
-    console.log(`Loaded ${documents.length} document chunks from MongoDB.`);
-  } catch (error) {
-    console.error('Failed to load documents from MongoDB:', error.message);
+  for (let start = 0; start < texts.length; start += EMBEDDING_BATCH_SIZE) {
+    const batch = texts.slice(start, start + EMBEDDING_BATCH_SIZE);
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${EMBEDDING_MODEL}:batchEmbedContents`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          requests: batch.map((text) => ({
+            model: `models/${EMBEDDING_MODEL}`,
+            content: { parts: [{ text }] },
+            taskType,
+            outputDimensionality: EMBEDDING_DIMENSIONS,
+          })),
+        }),
+      }
+    );
+    const result = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      const detail = result?.error?.message || response.statusText;
+      throw new HttpError(502, `Gemini embedding request failed (${response.status}): ${detail}`);
+    }
+
+    const batchEmbeddings = result?.embeddings?.map((item) => item.values);
+    if (
+      !Array.isArray(batchEmbeddings) ||
+      batchEmbeddings.length !== batch.length ||
+      batchEmbeddings.some(
+        (vector) =>
+          !Array.isArray(vector) ||
+          vector.length !== EMBEDDING_DIMENSIONS ||
+          vector.some((value) => !Number.isFinite(value))
+      )
+    ) {
+      throw new HttpError(502, 'Gemini returned invalid embedding vectors.');
+    }
+
+    embeddings.push(...batchEmbeddings);
   }
+
+  return embeddings;
+};
+
+const getPointCount = async () => {
+  const result = await qdrantRequest(
+    `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/count`,
+    { method: 'POST', body: JSON.stringify({ exact: true }) }
+  );
+  return result?.count ?? 0;
 };
 
 // ---------- Chunking ----------
-// Splits on paragraph breaks, then hard-wraps anything still too long.
-// A small overlap is kept between adjacent hard-wrapped slices so a fact
-// sitting on a chunk boundary isn't silently cut in half.
 const splitTextIntoChunks = (text) => {
   const rawBlocks = text.split(/\n\s*\n/);
   const chunks = [];
@@ -134,23 +175,8 @@ const STOPWORDS = new Set([
 
 const getQueryTerms = (message) => {
   const allTerms = String(message).toLowerCase().match(/\b\w+\b/g) || [];
-  const meaningful = allTerms.filter((w) => w.length > 1 && !STOPWORDS.has(w));
-  // If the query is entirely stopwords (e.g. "what is this"), fall back to
-  // the raw terms rather than returning zero matches.
+  const meaningful = allTerms.filter((word) => word.length > 1 && !STOPWORDS.has(word));
   return meaningful.length ? meaningful : allTerms;
-};
-
-const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-const scoreDocument = (queryTerms, docText) => {
-  const text = docText.toLowerCase();
-  let score = 0;
-  for (const term of queryTerms) {
-    const matches = text.match(new RegExp(`\\b${escapeRegExp(term)}\\b`, 'g'));
-    if (matches) score += matches.length;
-  }
-  // Slight length normalization so one giant chunk doesn't win purely on size.
-  return score / Math.sqrt(docText.length / 500 + 1);
 };
 
 const composeAnswer = (query, topDocs) => {
@@ -165,7 +191,7 @@ const composeAnswer = (query, topDocs) => {
       if (!clean || seen.has(clean)) continue;
       const lower = clean.toLowerCase();
       if (queryTerms.some((term) => lower.includes(term))) {
-        answers.push({ text: clean, source: doc.source, chunkIndex: doc.chunkIndex });
+        answers.push({ text: clean });
         seen.add(clean);
         if (answers.length >= 5) break;
       }
@@ -176,152 +202,207 @@ const composeAnswer = (query, topDocs) => {
   if (answers.length === 0) {
     const fallback = topDocs[0];
     return {
-      message: `I couldn't extract a precise answer, but here's the most relevant passage I found.`,
+      message: "I couldn't extract a precise answer, but here's the most relevant passage I found.",
       excerpt: fallback ? fallback.text.slice(0, 600) : null,
     };
   }
 
   return {
-    message: answers.map((a) => a.text).join(' '),
+    message: answers.map((answer) => answer.text).join(' '),
     excerpt: null,
   };
 };
 
-// ---------- Uploads ----------
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    cb(null, `${uniqueSuffix}-${file.originalname}`);
-  },
-});
-
+const storage = multer.memoryStorage();
 const upload = multer({
   storage,
   limits: { fileSize: MAX_UPLOAD_BYTES },
   fileFilter: (req, file, cb) => {
     const isPdf =
       file.mimetype === 'application/pdf' || /\.pdf$/i.test(file.originalname);
-    if (!isPdf) {
-      return cb(new Error('Only PDF files are supported.'));
-    }
+    if (!isPdf) return cb(new Error('Only PDF files are supported.'));
     cb(null, true);
   },
 });
 
+const asyncHandler = (handler) => (req, res, next) =>
+  Promise.resolve(handler(req, res, next)).catch(next);
+
 // ---------- Routes ----------
-app.get('/', (req, res) => {
-  res.json({ status: 'All Good!', uploadedDocuments: documents.length });
-});
+app.get('/', asyncHandler(async (req, res) => {
+  res.json({ status: 'All Good!', uploadedDocuments: await getPointCount() });
+}));
 
-app.get('/documents', (req, res) => {
-  const bySource = new Map();
-  for (const doc of documents) {
-    if (!bySource.has(doc.source)) {
-      bySource.set(doc.source, { source: doc.source, chunks: 0, uploadedAt: doc.uploadedAt || null });
+app.get('/documents', asyncHandler(async (req, res) => {
+  const documents = new Map();
+  let offset;
+
+  do {
+    const result = await qdrantRequest(
+      `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/scroll`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          limit: 1000,
+          with_payload: ['source', 'uploadedAt'],
+          with_vectors: false,
+          ...(offset !== undefined ? { offset } : {}),
+        }),
+      }
+    );
+
+    for (const point of result?.points || []) {
+      const { source, uploadedAt } = point.payload || {};
+      if (!source) continue;
+      const existing = documents.get(source);
+      if (existing) {
+        existing.chunks += 1;
+      } else {
+        documents.set(source, { source, chunks: 1, uploadedAt: uploadedAt || null });
+      }
     }
-    bySource.get(doc.source).chunks += 1;
-  }
-  res.json({ documents: Array.from(bySource.values()) });
-});
 
-app.post('/upload/pdf', upload.single('pdf'), async (req, res) => {
+    offset = result?.next_page_offset;
+  } while (offset !== null && offset !== undefined);
+
+  res.json({ documents: Array.from(documents.values()) });
+}));
+
+app.post('/upload/pdf', upload.single('pdf'), asyncHandler(async (req, res) => {
   if (!req.file) {
-    return res.status(400).json({ error: 'No PDF file uploaded.' });
+    throw new HttpError(400, 'No PDF file uploaded.');
   }
+
+  let data;
+  try {
+    data = await pdfParse(req.file.buffer);
+  } catch (error) {
+    console.error('Failed to parse PDF:', error.message);
+    throw new HttpError(422, 'Failed to parse this PDF. It may be corrupted or password-protected.');
+  }
+
+  if (!data.text || !data.text.trim()) {
+    throw new HttpError(
+      422,
+      'No extractable text found in this PDF. It may be a scanned image without OCR text.'
+    );
+  }
+
+  const chunks = splitTextIntoChunks(data.text);
+  const source = req.file.originalname;
+  const uploadedAt = new Date().toISOString();
 
   try {
-    const fileBuffer = fs.readFileSync(req.file.path);
-    const data = await pdfParse(fileBuffer);
-
-    if (!data.text || !data.text.trim()) {
-      fs.unlink(req.file.path, () => {});
-      return res.status(422).json({
-        error: 'No extractable text found in this PDF. It may be a scanned image without OCR text.',
-      });
-    }
-
-    const chunks = splitTextIntoChunks(data.text);
-    const source = req.file.originalname;
-    const uploadedAt = new Date().toISOString();
-
-    const newDocs = chunks.map((text, index) => ({
-      id: `${req.file.filename}-${index}`,
-      source,
-      storedFilename: req.file.filename,
-      chunkIndex: index + 1,
-      totalChunks: chunks.length,
-      text,
-      uploadedAt,
-    }));
-
-    documents = [...documents, ...newDocs];
-    await saveDocuments();
-
-    res.json({
-      message: 'uploaded',
-      source,
-      chunks: newDocs.length,
-      totalDocuments: documents.length,
-    });
+    const vectors = await embedTexts(chunks, 'RETRIEVAL_DOCUMENT');
+    await qdrantRequest(
+      `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          wait: true,
+          points: chunks.map((text, index) => ({
+            id: randomUUID(),
+            vector: vectors[index],
+            payload: {
+              source,
+              chunkIndex: index + 1,
+              totalChunks: chunks.length,
+              text,
+              uploadedAt,
+            },
+          })),
+        }),
+      }
+    );
   } catch (error) {
-    console.error('Failed to process PDF:', error.message);
-    fs.unlink(req.file.path, () => {});
-    res.status(500).json({ error: 'Failed to parse this PDF. It may be corrupted or password-protected.' });
-  }
-});
-
-app.delete('/documents/:source', async (req, res) => {
-  const source = decodeURIComponent(req.params.source);
-  const toRemove = documents.filter((doc) => doc.source === source);
-
-  if (!toRemove.length) {
-    return res.status(404).json({ error: 'No document found with that name.' });
+    console.error('Failed to embed or index PDF:', error.message);
+    throw error;
   }
 
-  const filenames = new Set(toRemove.map((doc) => doc.storedFilename).filter(Boolean));
-  for (const filename of filenames) {
-    const filePath = path.join(UPLOAD_DIR, filename);
-    fs.unlink(filePath, (err) => {
-      if (err && err.code !== 'ENOENT') console.error('Failed to delete file:', err.message);
-    });
+  res.json({
+    message: 'uploaded',
+    source,
+    chunks: chunks.length,
+    totalDocuments: await getPointCount(),
+  });
+}));
+
+app.delete('/documents/:source', asyncHandler(async (req, res) => {
+  const source = req.params.source;
+  const count = await qdrantRequest(
+    `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/count`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        exact: true,
+        filter: { must: [{ key: 'source', match: { value: source } }] },
+      }),
+    }
+  );
+
+  if (!count?.count) {
+    throw new HttpError(404, 'No document found with that name.');
   }
 
-  documents = documents.filter((doc) => doc.source !== source);
-  await saveDocuments();
+  await qdrantRequest(
+    `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/delete`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        wait: true,
+        filter: { must: [{ key: 'source', match: { value: source } }] },
+      }),
+    }
+  );
 
-  res.json({ message: 'deleted', source, remainingDocuments: documents.length });
-});
+  res.json({
+    message: 'deleted',
+    source,
+    remainingDocuments: await getPointCount(),
+  });
+}));
 
-const handleChat = (req, res) => {
+const handleChat = asyncHandler(async (req, res) => {
   const userQuery = String(req.body?.message ?? req.query?.message ?? '').trim();
   if (!userQuery) {
-    return res.status(400).json({ error: 'Query message is required.' });
+    throw new HttpError(400, 'Query message is required.');
   }
 
-  if (!documents.length) {
-    return res.json({
+  if (!(await getPointCount())) {
+    res.json({
       message: 'No PDFs are loaded yet. Upload one to start asking questions.',
       sources: [],
     });
+    return;
   }
 
-  const queryTerms = getQueryTerms(userQuery);
-  const scored = documents
-    .map((doc) => ({ ...doc, score: scoreDocument(queryTerms, doc.text) }))
-    .filter((doc) => doc.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 3);
+  const [queryVector] = await embedTexts([userQuery], 'RETRIEVAL_QUERY');
+  const result = await qdrantRequest(
+    `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/search`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        vector: queryVector,
+        limit: 3,
+        with_payload: true,
+      }),
+    }
+  );
+
+  const scored = (result || []).map((point) => ({
+    ...point.payload,
+    score: point.score,
+  }));
 
   if (!scored.length) {
-    return res.json({
+    res.json({
       message: "I couldn't find anything in the uploaded PDFs that matches that question. Try rephrasing it.",
       sources: [],
     });
+    return;
   }
 
   const { message, excerpt } = composeAnswer(userQuery, scored);
-
   res.json({
     message,
     excerpt,
@@ -332,28 +413,31 @@ const handleChat = (req, res) => {
       snippet: doc.text.slice(0, 220),
     })),
   });
-};
+});
 
 app.post('/chat', handleChat);
-app.get('/chat', handleChat); // kept for backward compatibility
+app.get('/chat', handleChat);
 
-// Multer / generic error handler — without this, upload errors (bad file
-// type, oversize file) crash with an unhandled response instead of JSON.
 app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError || err) {
-    return res.status(400).json({ error: err.message || 'Upload failed.' });
-  }
-  next();
+  if (res.headersSent) return next(err);
+  const status = err instanceof multer.MulterError ? 400 : (err.statusCode || 500);
+  if (status >= 500) console.error('Request failed:', err.message);
+  res.status(status).json({ error: err.message || 'Request failed.' });
 });
 
 const PORT = process.env.PORT || 8000;
 
 const bootstrap = async () => {
-  await connectMongo();
-  if (documentsCollection) {
-    await loadDocumentsFromMongo();
+  const missing = [
+    !GEMINI_API_KEY && 'GEMINI_API_KEY',
+    !QDRANT_URL && 'QDRANT_URL',
+    !QDRANT_API_KEY && 'QDRANT_API_KEY',
+  ].filter(Boolean);
+  if (missing.length) {
+    throw new Error(`Missing required online service configuration: ${missing.join(', ')}`);
   }
 
+  await ensureCollection();
   app.listen(PORT, () => console.log(`Server started on PORT:${PORT}`));
 };
 
