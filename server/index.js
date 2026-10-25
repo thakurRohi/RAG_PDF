@@ -933,6 +933,10 @@ app.get('/', asyncHandler(async (req, res) => {
   res.json({ status: 'All Good!' });
 }));
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
 app.get('/health/cache', asyncHandler(async (req, res) => {
   const [status] = await redisPipeline([['PING']]);
   if (status !== 'PONG') {

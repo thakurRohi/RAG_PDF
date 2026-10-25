@@ -52,10 +52,11 @@ PDFs/chunks to local files.
   dashboard, including `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and a stable
   `CREDENTIAL_ENCRYPTION_KEY`; the local `server/.env` file is not deployed.
   Use Render's assigned `PORT`.
-- Deploy the latest backend revision. Check that `GET /chats` and
-  `GET /health/cache` on the Render service no longer return 404; `/chats`
-  should return JSON. A 404 on either route means the deployed server does not
-  have the current API routes.
+- Deploy the latest backend revision. Check that `GET /health` returns
+  `{"status":"ok"}` without signing in; configure UptimeRobot to monitor this
+  URL. Check that `GET /chats` and `GET /health/cache` on the Render service
+  no longer return 404; `/chats` should return JSON. A 404 on these routes
+  means the deployed server does not have the current API routes.
 - In Vercel, set `NEXT_PUBLIC_API_URL` to the Render service's base URL only
   (for example, `https://your-service.onrender.com`, with no `/api` path).
   Also set `NEXT_PUBLIC_SUPABASE_URL` and
