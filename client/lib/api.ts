@@ -10,7 +10,41 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export type EmbeddingKeyMode = 'app' | 'custom';
+
+export interface EmbeddingCredentials {
+  mode: EmbeddingKeyMode;
+}
+
+export interface JinaApiKeySummary {
+  id: string;
+  label: string;
+  maskedKey: string;
+  createdAt: string;
+  usage: {
+    indexingTokens: number;
+    searchTokens: number;
+    validationTokens: number;
+    totalTokens: number;
+  };
+}
+
+export interface JinaApiKeysState {
+  keys: JinaApiKeySummary[];
+  activeKeyId: string | null;
+  appDefaultJinaUsage: {
+    indexingTokens: number;
+    searchTokens: number;
+    validationTokens: number;
+    totalTokens: number;
+  };
+}
+
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  embeddingCredentials?: EmbeddingCredentials
+): Promise<T> {
   const { data, error } = await getSupabaseClient().auth.getSession();
   if (error) throw new ApiError(`Could not read your sign-in session: ${error.message}`, 401);
   const accessToken = data.session?.access_token;
@@ -18,6 +52,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   const headers = new Headers(init?.headers);
   headers.set('Authorization', `Bearer ${accessToken}`);
+  if (embeddingCredentials) {
+    headers.set('X-Embedding-Key-Mode', embeddingCredentials.mode);
+  }
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, { ...init, headers });
@@ -75,12 +112,34 @@ export interface ChatConversation {
 export const api = {
   listDocuments: () => request<{ documents: DocumentSummary[] }>('/documents'),
 
-  uploadPdf: async (file: File) => {
+  getJinaApiKeys: () => request<JinaApiKeysState>('/embedding-keys'),
+
+  saveJinaApiKey: (label: string, jinaApiKey: string) =>
+    request<JinaApiKeysState>('/embedding-keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label, jinaApiKey }),
+    }),
+
+  setActiveJinaApiKey: (keyId: string | null) =>
+    request<JinaApiKeysState>('/embedding-keys/active', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keyId }),
+    }),
+
+  deleteJinaApiKey: (keyId: string) =>
+    request<JinaApiKeysState>(`/embedding-keys/${encodeURIComponent(keyId)}`, {
+      method: 'DELETE',
+    }),
+
+  uploadPdf: async (file: File, credentials: EmbeddingCredentials) => {
     const formData = new FormData();
     formData.append('pdf', file);
     return request<{ message: string; source: string; chunks: number; totalDocuments: number }>(
       '/upload/pdf',
-      { method: 'POST', body: formData }
+      { method: 'POST', body: formData },
+      credentials
     );
   },
 
@@ -113,10 +172,10 @@ export const api = {
       { method: 'DELETE' }
     ),
 
-  chat: (message: string, conversationId: string) =>
+  chat: (message: string, conversationId: string, credentials: EmbeddingCredentials) =>
     request<ChatResponse>('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message, conversationId }),
-    }),
+    }, credentials),
 };

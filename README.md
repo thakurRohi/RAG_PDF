@@ -21,8 +21,11 @@ PDFs/chunks to local files.
    Copy `server/.env.example` to `server/.env` and set `SUPABASE_URL` and
    `SUPABASE_ANON_KEY` from the Supabase project's API settings, as well as
    the Jina and Gemini embedding keys (Gemini is optional but recommended as
-   a fallback), Groq key, Qdrant cluster URL/API key, and Upstash REST
-   URL/token. Set `NEXT_PUBLIC_SUPABASE_URL` and
+   a fallback), `CREDENTIAL_ENCRYPTION_KEY`, Groq key, Qdrant cluster URL/API
+   key, and Upstash REST URL/token. Generate the encryption key with
+   `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`;
+   keep it secret and stable across deployments.
+   Set `NEXT_PUBLIC_SUPABASE_URL` and
    `NEXT_PUBLIC_SUPABASE_ANON_KEY` to the same Supabase project values in
    `client/.env.local.example` copied to `client/.env.local`. The anon/publishable
    key is intended for client use; never put a Supabase service-role key in the
@@ -46,8 +49,9 @@ PDFs/chunks to local files.
 - In Render, configure the web service with the repository's `server` root
   directory, `npm install` as the build command, and `npm start` as the start
   command. Add the variables from `server/.env.example` in the Render
-  dashboard, including `SUPABASE_URL` and `SUPABASE_ANON_KEY`; the local
-  `server/.env` file is not deployed. Use Render's assigned `PORT`.
+  dashboard, including `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and a stable
+  `CREDENTIAL_ENCRYPTION_KEY`; the local `server/.env` file is not deployed.
+  Use Render's assigned `PORT`.
 - Deploy the latest backend revision. Check that `GET /chats` and
   `GET /health/cache` on the Render service no longer return 404; `/chats`
   should return JSON. A 404 on either route means the deployed server does not
@@ -86,7 +90,39 @@ with Gemini; re-upload them to index them with Jina. The server filters
 retrieval by embedding provider to avoid comparing vectors from different
 models.
 
-Upstash Redis caches embeddings (keyed by model, task, and text hash),
+Users can choose the app's configured embedding keys or add and label multiple
+Jina API keys from the profile menu in the chat header. Sign out is also in
+that menu. Each key is validated with Jina, encrypted
+with AES-256-GCM, and stored in Upstash Redis under the authenticated user's
+account until that key is deleted. The raw key is not returned to the browser
+after saving. Users can select the active saved key or switch back to the
+app's key. Set `CREDENTIAL_ENCRYPTION_KEY` on the server to a base64-encoded
+32-byte random key (for example, generate one with
+`node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`).
+Keep this secret stable and backed up: changing it makes existing saved keys
+undecryptable. A key saved by the previous single-key version is migrated
+automatically when the key list is first loaded; historical usage is not
+available, so its counters start at zero. Selecting a user key forces Jina
+and does not fall back to the app's keys. PDFs selected for a chat must be
+indexed with Jina to use a user key; re-upload non-Jina PDFs while the user
+key option is selected. The profile menu shows per-key tokens reported by
+Jina, separated into PDF indexing, question searches, and key validation.
+These are totals tracked for requests made by this app; embedding-cache hits
+do not call Jina and do not add usage. The app-key option also displays the
+Jina tokens used by that signed-in user's requests when the configured provider
+or fallback is Jina; Gemini usage is not included. Jina does not expose a
+documented endpoint for retrieving an API key's available token balance, so
+the UI compares tracked usage against an initial 1,000,000-token baseline, not
+a live balance. Usage outside this app and additional token top-ups are not
+included in that comparison. The menu links to Jina's dashboard for the
+provider-side balance.
+Jina usage is billed to the account that owns the active key. The app still
+uses its configured Groq key for generated answers and its own Qdrant, Redis,
+and Supabase services. Jina embedding cache entries are scoped to a hash of
+the active key so vectors created under one key are not reused for another.
+
+Upstash Redis caches embeddings (keyed by model, task, credential hash, and
+text hash),
 retrieval results (keyed by query vector, selected PDFs, and document
 generation), and generated answers (keyed by retrieved passages and chat
 context). PDF uploads/deletions advance the document generation so stale
@@ -104,11 +140,14 @@ restarts. In the Upstash database **Data Browser**, search keys beginning with
 embedding vectors, retrieved PDF passages, and generated answers. Do not share
 the database URL/token or expose them in browser/client code.
 
-Chats appear in a conversation sidebar and each has its own saved history.
-Choose one or more PDFs for a chat before its first message; that scope is then
-locked so follow-up questions cannot pull context from a different PDF set.
-Vector searches are filtered to only those selected PDFs. Chat turns and chat
-metadata are stored in a separate Qdrant collection
+The app opens to a ready-to-use blank chat with the library sidebar closed.
+Open the sidebar to upload PDFs; choose one or more PDFs for the chat before
+its first message. Draft chats stay out of the conversation sidebar until the
+first question is answered, then the chat is saved there with a title based on
+that question. The PDF scope is locked after the first message so follow-up
+questions cannot pull context from a different PDF set. Vector searches are
+filtered to only those selected PDFs. Chat turns and chat metadata are stored
+in a separate Qdrant collection
 (`pdf_chunks_chat_history` by default), while the browser stores only the
 currently selected conversation ID in a per-account browser-storage key.
 Existing deployments create the required

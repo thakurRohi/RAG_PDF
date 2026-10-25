@@ -11,6 +11,7 @@ import {
   type ChatHistoryMessage,
   type ChatSource,
   type DocumentSummary,
+  type EmbeddingKeyMode,
 } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -20,11 +21,14 @@ interface IMessage extends ChatHistoryMessage {
 
 interface ChatComponentProps {
   documents: DocumentSummary[];
+  embeddingKeyMode: EmbeddingKeyMode;
+  onRefreshJinaApiKeys: () => Promise<void>;
   conversation: ChatConversation | null;
   isChatsLoaded: boolean;
   onConversationChange: (chat: ChatConversation) => void;
   isSidebarOpen: boolean;
   onToggleSidebar: () => void;
+  headerActions: React.ReactNode;
 }
 
 const SourceChip: React.FC<{ source: ChatSource }> = ({ source }) => (
@@ -40,11 +44,14 @@ const SourceChip: React.FC<{ source: ChatSource }> = ({ source }) => (
 
 const ChatComponent: React.FC<ChatComponentProps> = ({
   documents,
+  embeddingKeyMode,
+  onRefreshJinaApiKeys,
   conversation,
   isChatsLoaded,
   onConversationChange,
   isSidebarOpen,
   onToggleSidebar,
+  headerActions,
 }) => {
   const [message, setMessage] = React.useState('');
   const [messages, setMessages] = React.useState<IMessage[]>([]);
@@ -130,7 +137,10 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
     setMessage('');
     setIsSending(true);
     try {
-      const data = await api.chat(trimmed, conversationId);
+      const data = await api.chat(trimmed, conversationId, {
+        mode: embeddingKeyMode,
+      });
+      await onRefreshJinaApiKeys();
       if (activeConversationId.current === conversationId) {
         onConversationChange({
           ...currentConversation,
@@ -177,15 +187,15 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
 
   return (
     <main className="flex h-full min-w-0 flex-1 flex-col">
-      <header className="flex min-h-16 items-center justify-between gap-4 border-b border-border px-6 py-3">
-        <div className="flex min-w-0 items-center gap-3">
+      <header className="z-10 flex min-h-14 items-center justify-between gap-2 border-b border-border bg-background px-3 py-2 sm:min-h-16 sm:gap-4 sm:px-6 sm:py-3">
+        <div className="flex min-w-0 items-center gap-2 sm:gap-3">
           <button
             type="button"
             onClick={onToggleSidebar}
             aria-label={isSidebarOpen ? 'Hide sidebar' : 'Show sidebar and PDF upload'}
             title={isSidebarOpen ? 'Hide sidebar' : 'Show sidebar and PDF upload'}
             aria-expanded={isSidebarOpen}
-            className="shrink-0 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="shrink-0 rounded-md p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:p-1.5"
           >
             {isSidebarOpen ? (
               <PanelLeftClose className="size-4" aria-hidden="true" />
@@ -197,54 +207,57 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
             <h2 className="truncate text-sm font-semibold tracking-tight">
               {conversation?.title || 'PDF Chat'}
             </h2>
-            <p className="text-xs text-muted-foreground">
+            <p className="hidden truncate text-xs text-muted-foreground sm:block">
               {conversation
                 ? 'This chat only searches its selected PDFs'
                 : 'Create a chat and choose the PDFs it can use'}
             </p>
           </div>
         </div>
-        {conversation && (
-          <details className="group relative shrink-0">
-            <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm hover:bg-secondary">
-              <FileSearch className="size-4 text-primary" />
-              <span>{selectedSources.length} PDFs selected</span>
-              <span className="text-muted-foreground">▾</span>
-            </summary>
-            <div className="absolute right-0 z-20 mt-2 max-h-72 w-72 overflow-y-auto rounded-lg border border-border bg-card p-3 shadow-lg">
-              <p className="mb-2 text-xs text-muted-foreground">
-                Only selected PDFs are searched. The scope locks after the first message.
-              </p>
-              {documents.length === 0 ? (
-                <p className="py-2 text-sm text-muted-foreground">Upload PDFs in the library first.</p>
-              ) : (
-                <ul className="flex flex-col gap-1">
-                  {documents.map((doc) => (
-                    <li key={doc.source}>
-                      <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-sm hover:bg-secondary">
-                        <input
-                          type="checkbox"
-                          checked={selectedSources.includes(doc.source)}
-                          disabled={isSavingScope || isSending || conversation.hasMessages}
-                          onChange={(event) =>
-                            updateSelectedSources(doc.source, event.target.checked)
-                          }
-                          className="accent-primary"
-                        />
-                        <span className="min-w-0 flex-1 truncate" title={doc.source}>
-                          {doc.source}
-                        </span>
-                      </label>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </details>
-        )}
+        <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+          {conversation && (
+            <details className="group relative">
+              <summary className="flex max-w-32 cursor-pointer list-none items-center gap-1.5 rounded-md border border-border bg-card px-2 py-2 text-xs hover:bg-secondary sm:max-w-none sm:gap-2 sm:px-3 sm:text-sm">
+                <FileSearch className="size-4 text-primary" />
+                <span className="truncate">{selectedSources.length} PDFs</span>
+                <span className="text-muted-foreground">▾</span>
+              </summary>
+              <div className="absolute right-0 z-20 mt-2 max-h-[min(70dvh,18rem)] w-[min(18rem,calc(100vw-1.5rem))] overflow-y-auto rounded-lg border border-border bg-card p-3 shadow-lg sm:max-h-72 sm:w-72">
+                <p className="mb-2 text-xs text-muted-foreground">
+                  Only selected PDFs are searched. The scope locks after the first message.
+                </p>
+                {documents.length === 0 ? (
+                  <p className="py-2 text-sm text-muted-foreground">Upload PDFs in the library first.</p>
+                ) : (
+                  <ul className="flex flex-col gap-1">
+                    {documents.map((doc) => (
+                      <li key={doc.source}>
+                        <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-sm hover:bg-secondary">
+                          <input
+                            type="checkbox"
+                            checked={selectedSources.includes(doc.source)}
+                            disabled={isSavingScope || isSending || conversation.hasMessages}
+                            onChange={(event) =>
+                              updateSelectedSources(doc.source, event.target.checked)
+                            }
+                            className="accent-primary"
+                          />
+                          <span className="min-w-0 flex-1 truncate" title={doc.source}>
+                            {doc.source}
+                          </span>
+                        </label>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </details>
+          )}
+          {headerActions}
+        </div>
       </header>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-6">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-3 py-4 sm:px-6 sm:py-6">
         {!isChatsLoaded ? (
           <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
             Loading chats…
@@ -271,11 +284,13 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
                 ? conversation.hasMessages
                   ? 'Continue this conversation using its original PDF scope.'
                   : 'Ask a question about the PDFs selected for this chat.'
-                : 'Select one or more PDFs using the menu above to begin.'}
+                : documents.length
+                  ? 'Open the library to upload PDFs, then choose them from the selector above.'
+                  : 'Open the library to upload a PDF, then choose it here to start chatting.'}
             </p>
           </div>
         ) : (
-          <div className="mx-auto flex max-w-3xl flex-col gap-6">
+          <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 sm:gap-6">
             {messages.map((m, index) => (
               <div
                 key={index}
@@ -283,7 +298,7 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
               >
                 <div
                   className={cn(
-                    'max-w-[90%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-sm leading-relaxed',
+                    'max-w-[94%] break-words whitespace-pre-wrap rounded-2xl px-3 py-2.5 text-sm leading-relaxed sm:max-w-[90%] sm:px-4 sm:py-3',
                     m.role === 'user'
                       ? 'rounded-br-sm bg-primary text-primary-foreground'
                       : m.isError
@@ -304,7 +319,7 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
             ))}
             {isSending && (
               <div className="flex items-start">
-                <div className="flex items-center gap-2 rounded-2xl rounded-bl-sm border border-border bg-card px-4 py-2.5 text-sm text-muted-foreground">
+                <div className="flex items-center gap-2 rounded-2xl rounded-bl-sm border border-border bg-card px-3 py-2.5 text-xs text-muted-foreground sm:px-4 sm:text-sm">
                   <Loader2 className="size-3.5 animate-spin" />
                   Searching selected PDFs…
                 </div>
@@ -315,7 +330,7 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
       </div>
 
       {conversation && (
-        <div className="border-t border-border bg-card px-6 py-4">
+        <div className="border-t border-border bg-card px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-6 sm:py-4">
           {historyError && (
             <p role="alert" className="mx-auto mb-2 max-w-3xl text-xs text-destructive">
               {historyError}

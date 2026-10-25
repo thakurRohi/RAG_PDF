@@ -1,23 +1,28 @@
 'use client';
 
 import * as React from 'react';
-import { FileText, Loader2, MessageSquare, MessageSquarePlus, Trash2, UploadCloud } from 'lucide-react';
-import { api, ApiError, type ChatConversation, type DocumentSummary } from '@/lib/api';
+import { FileText, Loader2, MessageSquare, MessageSquarePlus, Trash2, UploadCloud, X } from 'lucide-react';
+import {
+  api,
+  ApiError,
+  type ChatConversation,
+  type DocumentSummary,
+  type EmbeddingKeyMode,
+} from '@/lib/api';
 import { cn } from '@/lib/utils';
-import ThemeToggle from './theme-toggle';
 
 interface LibraryPanelProps {
   documents: DocumentSummary[];
   onDocumentsChange: (docs: DocumentSummary[]) => void;
+  embeddingKeyMode: EmbeddingKeyMode;
+  onRefreshJinaApiKeys: () => Promise<void>;
   chats: ChatConversation[];
-  userEmail: string;
-  authError: string | null;
   activeChatId: string | null;
   chatsError: string | null;
   onSelectChat: (conversationId: string) => void;
   onNewChat: () => void;
   onDeleteChat: (conversationId: string) => Promise<boolean>;
-  onSignOut: () => void;
+  onCloseSidebar: () => void;
 }
 
 const formatBytesFriendlyName = (name: string) => {
@@ -28,15 +33,15 @@ const formatBytesFriendlyName = (name: string) => {
 const LibraryPanel: React.FC<LibraryPanelProps> = ({
   documents,
   onDocumentsChange,
+  embeddingKeyMode,
+  onRefreshJinaApiKeys,
   chats,
-  userEmail,
-  authError,
   activeChatId,
   chatsError,
   onSelectChat,
   onNewChat,
   onDeleteChat,
-  onSignOut,
+  onCloseSidebar,
 }) => {
   const inputRef = React.useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = React.useState(false);
@@ -85,8 +90,11 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
 
     setIsUploading(true);
     try {
-      await api.uploadPdf(file);
+      await api.uploadPdf(file, {
+        mode: embeddingKeyMode,
+      });
       await refreshDocuments();
+      await onRefreshJinaApiKeys();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Upload failed. Please try again.');
     } finally {
@@ -122,34 +130,24 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
 
   return (
     <aside className="flex h-full w-full flex-col overflow-y-auto overscroll-y-contain border-r border-border bg-card">
-      <div className="flex shrink-0 items-start justify-between gap-3 px-5 pt-6 pb-4">
+      <div className="flex shrink-0 items-start justify-between gap-3 px-4 pb-4 pt-5 sm:px-5 sm:pt-6">
         <div>
           <h1 className="text-base font-semibold tracking-tight">Library</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <p className="mt-1 text-xs text-muted-foreground sm:text-sm">
             Upload PDFs, then ask questions about them.
           </p>
-          <p className="mt-2 max-w-44 truncate text-xs text-muted-foreground" title={userEmail}>
-            Signed in as {userEmail}
-          </p>
-          {authError && (
-            <p role="alert" className="mt-2 max-w-48 text-xs text-destructive">
-              {authError}
-            </p>
-          )}
         </div>
-        <div className="flex shrink-0 flex-col items-end gap-2">
-          <ThemeToggle />
-          <button
-            type="button"
-            onClick={onSignOut}
-            className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-secondary hover:text-foreground"
-          >
-            Sign out
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={onCloseSidebar}
+          aria-label="Close library sidebar"
+          className="rounded-md p-2 text-muted-foreground hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:hidden"
+        >
+          <X className="size-4" aria-hidden="true" />
+        </button>
       </div>
 
-      <div className="shrink-0 px-5">
+      <div className="shrink-0 px-4 sm:px-5">
         <div
           onClick={() => inputRef.current?.click()}
           onDragOver={(e) => {
@@ -164,7 +162,7 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
             if (e.key === 'Enter' || e.key === ' ') inputRef.current?.click();
           }}
           className={cn(
-            'flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-8 text-center transition-colors',
+            'flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-5 text-center transition-colors sm:py-8',
             isDragging
               ? 'border-primary bg-primary-soft'
               : 'border-border hover:border-primary/50 hover:bg-secondary'
@@ -216,7 +214,7 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
         >
           {chats.length === 0 ? (
             <p className="px-2 py-2 text-xs text-muted-foreground">
-              Start a new chat to ask about selected PDFs.
+              Your chats will appear here after your first question.
             </p>
           ) : (
             <ul className="flex flex-col gap-1">
@@ -238,7 +236,7 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
                     onClick={() => setChatToDelete(chat)}
                     aria-label={`Delete chat ${chat.title}`}
                     title="Delete chat"
-                    className="rounded-md p-1.5 text-muted-foreground opacity-0 hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
+                    className="rounded-md p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:p-1.5 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100"
                   >
                     <Trash2 className="size-3.5" />
                   </button>
@@ -288,7 +286,7 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
                     onClick={() => handleDelete(doc.source)}
                     disabled={deletingSource === doc.source}
                     aria-label={`Remove ${doc.source}`}
-                    className="shrink-0 rounded-md p-1.5 text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 disabled:opacity-50"
+                    className="shrink-0 rounded-md p-2 text-muted-foreground transition-opacity hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:p-1.5 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100 disabled:opacity-50"
                   >
                     {deletingSource === doc.source ? (
                       <Loader2 className="size-3.5 animate-spin" />

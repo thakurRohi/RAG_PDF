@@ -3,7 +3,13 @@ import cors from 'cors';
 import multer from 'multer';
 import pdfParse from 'pdf-parse';
 import dotenv from 'dotenv';
-import { createHash, randomUUID } from 'crypto';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+  randomUUID,
+} from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
@@ -41,7 +47,11 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const JINA_API_KEY = process.env.JINA_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const CREDENTIAL_ENCRYPTION_KEY = process.env.CREDENTIAL_ENCRYPTION_KEY;
 const CACHE_PREFIX = 'pdf-rag:v1';
+const CREDENTIAL_ENCRYPTION_ALGORITHM = 'aes-256-gcm';
+const JINA_KEY_USAGE_CATEGORIES = ['indexing', 'search', 'validation'];
+const APP_DEFAULT_JINA_KEY_ID = 'app-default';
 const supabaseAuth = SUPABASE_URL && SUPABASE_ANON_KEY
   ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       auth: { autoRefreshToken: false, persistSession: false },
@@ -61,6 +71,70 @@ class HttpError extends Error {
 }
 
 class EmbeddingProviderError extends HttpError {}
+
+const getCredentialEncryptionKey = () => {
+  if (!CREDENTIAL_ENCRYPTION_KEY) {
+    throw new Error('CREDENTIAL_ENCRYPTION_KEY is not configured.');
+  }
+  const key = Buffer.from(CREDENTIAL_ENCRYPTION_KEY, 'base64');
+  if (key.length !== 32) {
+    throw new Error('CREDENTIAL_ENCRYPTION_KEY must be a base64-encoded 32-byte key.');
+  }
+  return key;
+};
+
+const encryptCredential = (value, userId, keyId) => {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv(
+    CREDENTIAL_ENCRYPTION_ALGORITHM,
+    getCredentialEncryptionKey(),
+    iv
+  );
+  cipher.setAAD(Buffer.from(keyId === null ? userId : `${userId}:${keyId}`));
+  const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+  return JSON.stringify({
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+  });
+};
+
+const decryptCredential = (encrypted, userId, keyId) => {
+  try {
+    const record = JSON.parse(encrypted);
+    const decipher = createDecipheriv(
+      CREDENTIAL_ENCRYPTION_ALGORITHM,
+      getCredentialEncryptionKey(),
+      Buffer.from(record.iv, 'base64')
+    );
+    decipher.setAAD(Buffer.from(keyId === null ? userId : `${userId}:${keyId}`));
+    decipher.setAuthTag(Buffer.from(record.tag, 'base64'));
+    return Buffer.concat([
+      decipher.update(Buffer.from(record.ciphertext, 'base64')),
+      decipher.final(),
+    ]).toString('utf8');
+  } catch {
+    throw new HttpError(
+      503,
+      'The saved Jina key could not be decrypted. Check the server credential-encryption configuration.'
+    );
+  }
+};
+
+const jinaCredentialIndexKey = (userId) =>
+  `${CACHE_PREFIX}:user-jina-keys:${cacheDigest(userId)}`;
+
+const jinaCredentialRecordKey = (userId, keyId) =>
+  `${jinaCredentialIndexKey(userId)}:${keyId}`;
+
+const jinaCredentialActiveKey = (userId) =>
+  `${jinaCredentialIndexKey(userId)}:active`;
+
+const jinaCredentialUsageKey = (userId, keyId, category) =>
+  `${jinaCredentialIndexKey(userId)}:${keyId}:usage:${category}`;
+
+const legacyJinaCredentialKey = (userId) =>
+  `${CACHE_PREFIX}:user-jina-key:${cacheDigest(userId)}`;
 
 const qdrantRequest = async (endpoint, options = {}) => {
   const response = await fetch(`${QDRANT_URL}${endpoint}`, {
@@ -136,6 +210,124 @@ const cacheSetMany = async (entries, ttlSeconds, category, embeddingNamespace) =
 
 const cacheDigest = (value) =>
   createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+const recordJinaKeyUsage = async (userId, keyId, category, totalTokens) => {
+  if (!Number.isSafeInteger(totalTokens) || totalTokens < 0) {
+    console.warn('Jina did not return a valid total_tokens value; usage was not recorded.');
+    return;
+  }
+  await redisPipeline([
+    ['INCRBY', jinaCredentialUsageKey(userId, keyId, category), totalTokens],
+    ['INCRBY', jinaCredentialUsageKey(userId, keyId, 'total'), totalTokens],
+  ]);
+};
+
+const getJinaKeysState = async (userId) => {
+  const indexKey = jinaCredentialIndexKey(userId);
+  let [keyIds, activeKeyId, legacyEncryptedKey] = await redisPipeline([
+    ['SMEMBERS', indexKey],
+    ['GET', jinaCredentialActiveKey(userId)],
+    ['GET', legacyJinaCredentialKey(userId)],
+  ]);
+
+  if ((!Array.isArray(keyIds) || keyIds.length === 0) && legacyEncryptedKey) {
+    const legacyApiKey = decryptCredential(legacyEncryptedKey, userId, null);
+    const migratedKeyId = `legacy-${cacheDigest(userId).slice(0, 12)}`;
+    const migratedRecord = {
+      label: 'Migrated Jina key',
+      encryptedKey: encryptCredential(legacyApiKey, userId, migratedKeyId),
+      maskedKey: `****${legacyApiKey.slice(-4)}`,
+      createdAt: new Date().toISOString(),
+    };
+    await redisPipeline([
+      ['SET', jinaCredentialRecordKey(userId, migratedKeyId), JSON.stringify(migratedRecord)],
+      ['SADD', indexKey, migratedKeyId],
+      ['SET', jinaCredentialActiveKey(userId), migratedKeyId, 'NX'],
+      ['DEL', legacyJinaCredentialKey(userId)],
+    ]);
+    [keyIds, activeKeyId] = await redisPipeline([
+      ['SMEMBERS', indexKey],
+      ['GET', jinaCredentialActiveKey(userId)],
+    ]);
+  }
+
+  const availableKeyIds = Array.isArray(keyIds) ? keyIds : [];
+  const records = availableKeyIds.length
+    ? await redisPipeline(availableKeyIds.map((keyId) => [
+      'GET',
+      jinaCredentialRecordKey(userId, keyId),
+    ]))
+    : [];
+  const usageValues = availableKeyIds.length
+    ? await redisPipeline(availableKeyIds.flatMap((keyId) => [
+      ...JINA_KEY_USAGE_CATEGORIES.map((category) => [
+        'GET',
+        jinaCredentialUsageKey(userId, keyId, category),
+      ]),
+      ['GET', jinaCredentialUsageKey(userId, keyId, 'total')],
+    ]))
+    : [];
+  const appDefaultUsageValues = await redisPipeline([
+    ...JINA_KEY_USAGE_CATEGORIES.map((category) => [
+      'GET',
+      jinaCredentialUsageKey(userId, APP_DEFAULT_JINA_KEY_ID, category),
+    ]),
+    ['GET', jinaCredentialUsageKey(userId, APP_DEFAULT_JINA_KEY_ID, 'total')],
+  ]);
+  const appDefaultUsageNumbers = appDefaultUsageValues.map((value) => {
+    const parsed = Number(value || 0);
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+      throw new HttpError(503, 'Upstash returned invalid default Jina usage totals.');
+    }
+    return parsed;
+  });
+  const keys = [];
+  for (let index = 0; index < availableKeyIds.length; index += 1) {
+    const keyId = availableKeyIds[index];
+    const rawRecord = records[index];
+    if (!rawRecord) continue;
+    let record;
+    try {
+      record = JSON.parse(rawRecord);
+    } catch {
+      throw new HttpError(503, 'Upstash returned an invalid saved Jina key record.');
+    }
+    const usageNumbers = usageValues
+      .slice(index * (JINA_KEY_USAGE_CATEGORIES.length + 1), (index + 1) * (JINA_KEY_USAGE_CATEGORIES.length + 1))
+      .map((value) => {
+        const parsed = Number(value || 0);
+        if (!Number.isSafeInteger(parsed) || parsed < 0) {
+          throw new HttpError(503, 'Upstash returned invalid Jina usage totals.');
+        }
+        return parsed;
+      });
+    keys.push({
+      id: keyId,
+      label: record.label,
+      maskedKey: record.maskedKey,
+      createdAt: record.createdAt,
+      usage: {
+        indexingTokens: usageNumbers[0],
+        searchTokens: usageNumbers[1],
+        validationTokens: usageNumbers[2],
+        totalTokens: usageNumbers[3],
+      },
+    });
+  }
+  keys.sort((left, right) =>
+    left.label.localeCompare(right.label) || left.createdAt.localeCompare(right.createdAt)
+  );
+  return {
+    keys,
+    activeKeyId: keys.some((key) => key.id === activeKeyId) ? activeKeyId : null,
+    appDefaultJinaUsage: {
+      indexingTokens: appDefaultUsageNumbers[0],
+      searchTokens: appDefaultUsageNumbers[1],
+      validationTokens: appDefaultUsageNumbers[2],
+      totalTokens: appDefaultUsageNumbers[3],
+    },
+  };
+};
 
 const embeddingRegistryKey = (namespace) =>
   `${CACHE_PREFIX}:embedding-keys:${cacheDigest(namespace)}`;
@@ -241,13 +433,18 @@ const getRetryDelayMs = (response, result) => {
   return retryMessageSeconds ? Number(retryMessageSeconds) * 1000 : null;
 };
 
-const requestJinaEmbeddings = async (batch, taskType) => {
+const requestJinaEmbeddings = async (
+  batch,
+  taskType,
+  apiKey = JINA_API_KEY,
+  usageContext
+) => {
   let response;
   try {
     response = await fetch('https://api.jina.ai/v1/embeddings', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${JINA_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
@@ -266,7 +463,7 @@ const requestJinaEmbeddings = async (batch, taskType) => {
   if (!response.ok) {
     const detail = result?.detail || result?.message || response.statusText;
     throw new EmbeddingProviderError(
-      response.status === 429 ? 429 : 502,
+      response.status === 429 ? 429 : ([401, 403].includes(response.status) ? 400 : 502),
       `Jina embedding request failed (${response.status}): ${detail}`
     );
   }
@@ -293,9 +490,19 @@ const requestJinaEmbeddings = async (batch, taskType) => {
     throw new EmbeddingProviderError(502, 'Jina returned invalid embedding vectors.');
   }
 
-  return [...data]
+  const vectors = [...data]
     .sort((left, right) => left.index - right.index)
     .map((item) => item.embedding);
+  const totalTokens = result?.usage?.total_tokens;
+  if (usageContext) {
+    await recordJinaKeyUsage(
+      usageContext.userId,
+      usageContext.keyId,
+      usageContext.category,
+      totalTokens
+    );
+  }
+  return { vectors, totalTokens };
 };
 
 const requestGeminiEmbeddings = async (batch, taskType) => {
@@ -367,10 +574,26 @@ const requestGeminiEmbeddings = async (batch, taskType) => {
   return vectors;
 };
 
-const embedWithProvider = async (texts, taskType, namespace, provider) => {
+const embedWithProvider = async (
+  texts,
+  taskType,
+  namespace,
+  provider,
+  jinaApiKey,
+  usageContext
+) => {
   const model = provider === 'jina' ? JINA_EMBEDDING_MODEL : GEMINI_EMBEDDING_MODEL;
+  const credentialScope = provider === 'jina' ? cacheDigest(jinaApiKey || 'app') : 'app';
   const keys = texts.map((text) =>
-    `${CACHE_PREFIX}:embedding:${cacheDigest([namespace, provider, model, EMBEDDING_DIMENSIONS, taskType, text])}`
+    `${CACHE_PREFIX}:embedding:${cacheDigest([
+      namespace,
+      provider,
+      model,
+      EMBEDDING_DIMENSIONS,
+      taskType,
+      credentialScope,
+      text,
+    ])}`
   );
   const cached = await cacheGetMany(keys, 'embeddings');
   const embeddings = new Array(texts.length);
@@ -400,9 +623,10 @@ const embedWithProvider = async (texts, taskType, namespace, provider) => {
 
   for (let start = 0; start < missing.length; start += EMBEDDING_BATCH_SIZE) {
     const batch = missing.slice(start, start + EMBEDDING_BATCH_SIZE);
-    const batchEmbeddings = provider === 'jina'
-      ? await requestJinaEmbeddings(batch, taskType)
-      : await requestGeminiEmbeddings(batch, taskType);
+    const batchResult = provider === 'jina'
+      ? await requestJinaEmbeddings(batch, taskType, jinaApiKey, usageContext)
+      : { vectors: await requestGeminiEmbeddings(batch, taskType) };
+    const batchEmbeddings = batchResult.vectors;
 
     const cacheEntries = [];
     batch.forEach(({ index }, batchIndex) => {
@@ -427,21 +651,60 @@ const embedTexts = async (
   texts,
   taskType,
   namespace = 'shared',
-  preferredProvider = JINA_API_KEY ? 'jina' : 'gemini'
+  preferredProvider = JINA_API_KEY ? 'jina' : 'gemini',
+  customJinaApiKey,
+  appUsageUserId
 ) => {
+  if (customJinaApiKey !== undefined) {
+    if (!customJinaApiKey?.apiKey || !customJinaApiKey?.keyId) {
+      throw new HttpError(400, 'A Jina API key is required when using your own key.');
+    }
+    return embedWithProvider(texts, taskType, namespace, 'jina', customJinaApiKey.apiKey, {
+      userId: customJinaApiKey.userId,
+      keyId: customJinaApiKey.keyId,
+      category: taskType === 'RETRIEVAL_DOCUMENT' ? 'indexing' : 'search',
+    });
+  }
+
   const primaryKey = preferredProvider === 'jina' ? JINA_API_KEY : GEMINI_API_KEY;
   const fallbackProvider = preferredProvider === 'jina' ? 'gemini' : 'jina';
   const fallbackKey = fallbackProvider === 'jina' ? JINA_API_KEY : GEMINI_API_KEY;
 
   if (primaryKey) {
     try {
-      return await embedWithProvider(texts, taskType, namespace, preferredProvider);
+      return await embedWithProvider(
+        texts,
+        taskType,
+        namespace,
+        preferredProvider,
+        preferredProvider === 'jina' ? JINA_API_KEY : undefined,
+        preferredProvider === 'jina'
+          ? {
+            userId: appUsageUserId,
+            keyId: APP_DEFAULT_JINA_KEY_ID,
+            category: taskType === 'RETRIEVAL_DOCUMENT' ? 'indexing' : 'search',
+          }
+          : undefined
+      );
     } catch (error) {
       if (!(error instanceof EmbeddingProviderError) || !fallbackKey) throw error;
       console.warn(
         `${preferredProvider === 'jina' ? 'Jina' : 'Gemini'} embeddings unavailable; falling back to ${fallbackProvider}: ${error.message}`
       );
-      return embedWithProvider(texts, taskType, namespace, fallbackProvider);
+      return embedWithProvider(
+        texts,
+        taskType,
+        namespace,
+        fallbackProvider,
+        fallbackProvider === 'jina' ? JINA_API_KEY : undefined,
+        fallbackProvider === 'jina'
+          ? {
+            userId: appUsageUserId,
+            keyId: APP_DEFAULT_JINA_KEY_ID,
+            category: taskType === 'RETRIEVAL_DOCUMENT' ? 'indexing' : 'search',
+          }
+          : undefined
+      );
     }
   }
 
@@ -693,6 +956,142 @@ app.get('/health/cache', asyncHandler(async (req, res) => {
 }));
 
 app.use(requireAuth);
+
+app.get('/embedding-keys', asyncHandler(async (req, res) => {
+  res.json(await getJinaKeysState(req.userId));
+}));
+
+app.post('/embedding-keys', asyncHandler(async (req, res) => {
+  const jinaApiKey = String(req.body?.jinaApiKey ?? '').trim();
+  const label = String(req.body?.label ?? '').trim();
+  if (!jinaApiKey) {
+    throw new HttpError(400, 'Enter a Jina API key.');
+  }
+  if (jinaApiKey.length > 2048) {
+    throw new HttpError(400, 'The Jina API key is too long.');
+  }
+  if (!label || label.length > 50) {
+    throw new HttpError(400, 'Enter a key label of 1 to 50 characters.');
+  }
+
+  const existingState = await getJinaKeysState(req.userId);
+  if (existingState.keys.some((key) => key.label.toLocaleLowerCase() === label.toLocaleLowerCase())) {
+    throw new HttpError(409, 'A saved Jina key already uses that label.');
+  }
+
+  const validation = await requestJinaEmbeddings(
+    [{ text: 'Validate this Jina API key.', index: 0 }],
+    'RETRIEVAL_QUERY',
+    jinaApiKey
+  );
+  const keyId = randomUUID();
+  const record = {
+    label,
+    encryptedKey: encryptCredential(jinaApiKey, req.userId, keyId),
+    maskedKey: `****${jinaApiKey.slice(-4)}`,
+    createdAt: new Date().toISOString(),
+  };
+  const saveCommands = [
+    ['SET', jinaCredentialRecordKey(req.userId, keyId), JSON.stringify(record)],
+    ['SADD', jinaCredentialIndexKey(req.userId), keyId],
+    ['SET', jinaCredentialActiveKey(req.userId), keyId],
+  ];
+  if (Number.isSafeInteger(validation.totalTokens) && validation.totalTokens >= 0) {
+    saveCommands.push(
+      ['INCRBY', jinaCredentialUsageKey(req.userId, keyId, 'validation'), validation.totalTokens],
+      ['INCRBY', jinaCredentialUsageKey(req.userId, keyId, 'total'), validation.totalTokens]
+    );
+  } else {
+    console.warn('Jina key validation succeeded without total_tokens usage metadata.');
+  }
+  await redisPipeline(saveCommands);
+  res.status(201).json(await getJinaKeysState(req.userId));
+}));
+
+app.put('/embedding-keys/active', asyncHandler(async (req, res) => {
+  const keyId = req.body?.keyId;
+  if (keyId === null) {
+    await redisPipeline([['DEL', jinaCredentialActiveKey(req.userId)]]);
+    res.json(await getJinaKeysState(req.userId));
+    return;
+  }
+  if (typeof keyId !== 'string' || !/^[\w-]{1,100}$/.test(keyId)) {
+    throw new HttpError(400, 'Select a valid saved Jina key.');
+  }
+
+  const [record] = await redisPipeline([
+    ['GET', jinaCredentialRecordKey(req.userId, keyId)],
+  ]);
+  if (!record) throw new HttpError(404, 'Saved Jina key not found.');
+  await redisPipeline([['SET', jinaCredentialActiveKey(req.userId), keyId]]);
+  res.json(await getJinaKeysState(req.userId));
+}));
+
+app.delete('/embedding-keys/:keyId', asyncHandler(async (req, res) => {
+  const { keyId } = req.params;
+  if (!/^[\w-]{1,100}$/.test(keyId)) {
+    throw new HttpError(400, 'Invalid saved Jina key ID.');
+  }
+  const recordKey = jinaCredentialRecordKey(req.userId, keyId);
+  const [record, activeKeyId] = await redisPipeline([
+    ['GET', recordKey],
+    ['GET', jinaCredentialActiveKey(req.userId)],
+  ]);
+  if (!record) throw new HttpError(404, 'Saved Jina key not found.');
+
+  await redisPipeline([
+    ['SREM', jinaCredentialIndexKey(req.userId), keyId],
+    ['DEL', recordKey],
+    ...[...JINA_KEY_USAGE_CATEGORIES, 'total'].map((category) => [
+      'DEL',
+      jinaCredentialUsageKey(req.userId, keyId, category),
+    ]),
+  ]);
+  if (activeKeyId === keyId) {
+    const [remainingIds] = await redisPipeline([
+      ['SMEMBERS', jinaCredentialIndexKey(req.userId)],
+    ]);
+    if (Array.isArray(remainingIds) && remainingIds.length) {
+      await redisPipeline([
+        ['SET', jinaCredentialActiveKey(req.userId), remainingIds[0]],
+      ]);
+    } else {
+      await redisPipeline([['DEL', jinaCredentialActiveKey(req.userId)]]);
+    }
+  }
+  res.json(await getJinaKeysState(req.userId));
+}));
+
+const getCustomJinaApiKey = async (req) => {
+  const mode = req.get('x-embedding-key-mode');
+  if (mode === undefined) return undefined;
+  if (mode === 'app') return undefined;
+  if (mode !== 'custom') {
+    throw new HttpError(400, 'Invalid embedding API key mode.');
+  }
+
+  const [activeKeyId] = await redisPipeline([
+    ['GET', jinaCredentialActiveKey(req.userId)],
+  ]);
+  if (!activeKeyId) {
+    throw new HttpError(400, 'Select a saved Jina API key or choose the app’s key.');
+  }
+  const [rawRecord] = await redisPipeline([
+    ['GET', jinaCredentialRecordKey(req.userId, activeKeyId)],
+  ]);
+  if (!rawRecord) throw new HttpError(404, 'The selected Jina API key was not found.');
+  let record;
+  try {
+    record = JSON.parse(rawRecord);
+  } catch {
+    throw new HttpError(503, 'Upstash returned an invalid saved Jina key record.');
+  }
+  return {
+    userId: req.userId,
+    keyId: activeKeyId,
+    apiKey: decryptCredential(record.encryptedKey, req.userId, activeKeyId),
+  };
+};
 
 app.get('/documents', asyncHandler(async (req, res) => {
   const documents = new Map();
@@ -995,12 +1394,16 @@ app.post('/upload/pdf', upload.single('pdf'), asyncHandler(async (req, res) => {
   const source = req.file.originalname;
   const uploadedAt = new Date().toISOString();
   const embeddingNamespace = `${req.userId}:${source}`;
+  const customJinaApiKey = await getCustomJinaApiKey(req);
 
   try {
     const { vectors, provider } = await embedTexts(
       chunks,
       'RETRIEVAL_DOCUMENT',
-      embeddingNamespace
+      embeddingNamespace,
+      undefined,
+      customJinaApiKey,
+      req.userId
     );
     await qdrantRequest(
       `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points`,
@@ -1096,6 +1499,7 @@ const handleChat = asyncHandler(async (req, res) => {
   }
   const conversation = await getConversation(conversationId, req.userId);
   const selectedSources = conversation.selectedSources || [];
+  const customJinaApiKey = await getCustomJinaApiKey(req);
   if (!selectedSources.length) {
     throw new HttpError(400, 'Select at least one PDF for this chat before sending a message.');
   }
@@ -1116,10 +1520,47 @@ const handleChat = asyncHandler(async (req, res) => {
       }),
     }
   );
+  if (customJinaApiKey) {
+    if (!jinaDocumentCount?.count) {
+      throw new HttpError(
+        409,
+        'These PDFs were not indexed with Jina. Choose the app’s key or delete and re-upload the PDFs using your Jina key.'
+      );
+    }
+    const nonJinaDocumentCount = await qdrantRequest(
+      `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/count`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          exact: true,
+          filter: {
+            must: [
+              { key: 'source', match: { any: selectedSources } },
+              { key: 'ownerId', match: { value: req.userId } },
+            ],
+            must_not: [{ key: 'embeddingProvider', match: { value: 'jina' } }],
+          },
+        }),
+      }
+    );
+    if (nonJinaDocumentCount?.count) {
+      throw new HttpError(
+        409,
+        'Some selected PDFs were not indexed with Jina. Delete and re-upload them using your Jina key before using it for this chat.'
+      );
+    }
+  }
   const preferredProvider = jinaDocumentCount?.count ? 'jina' : 'gemini';
 
   const [{ vectors: [queryVector], provider }, documentGeneration] = await Promise.all([
-    embedTexts([userQuery], 'RETRIEVAL_QUERY', req.userId, preferredProvider),
+    embedTexts(
+      [userQuery],
+      'RETRIEVAL_QUERY',
+      req.userId,
+      preferredProvider,
+      customJinaApiKey,
+      req.userId
+    ),
     getDocumentGeneration(),
   ]);
   const retrievalCacheKey = `${CACHE_PREFIX}:retrieval:${cacheDigest([
@@ -1272,6 +1713,7 @@ const bootstrap = async () => {
     !JINA_API_KEY && !GEMINI_API_KEY && 'JINA_API_KEY or GEMINI_API_KEY',
     !SUPABASE_URL && 'SUPABASE_URL',
     !SUPABASE_ANON_KEY && 'SUPABASE_ANON_KEY',
+    !CREDENTIAL_ENCRYPTION_KEY && 'CREDENTIAL_ENCRYPTION_KEY',
     !GROQ_API_KEY && 'GROQ_API_KEY',
     !QDRANT_URL && 'QDRANT_URL',
     !QDRANT_API_KEY && 'QDRANT_API_KEY',
@@ -1281,6 +1723,7 @@ const bootstrap = async () => {
   if (missing.length) {
     throw new Error(`Missing required online service configuration: ${missing.join(', ')}`);
   }
+  getCredentialEncryptionKey();
 
   await ensureCollection(QDRANT_COLLECTION);
   await ensureCollection(QDRANT_CHAT_COLLECTION);
