@@ -1,7 +1,17 @@
 'use client';
 
 import * as React from 'react';
-import { FileText, Loader2, MessageSquare, MessageSquarePlus, Trash2, UploadCloud, X } from 'lucide-react';
+import {
+  CheckCircle2,
+  FileText,
+  Loader2,
+  MessageSquare,
+  MessageSquarePlus,
+  Trash2,
+  UploadCloud,
+  X,
+} from 'lucide-react';
+import { useToast } from './toast-provider';
 import {
   api,
   ApiError,
@@ -43,9 +53,12 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
   onDeleteChat,
   onCloseSidebar,
 }) => {
+  const { toast } = useToast();
   const inputRef = React.useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = React.useState(false);
   const [isUploading, setIsUploading] = React.useState(false);
+  const [uploadSuccess, setUploadSuccess] = React.useState<string | null>(null);
+  const [failedFile, setFailedFile] = React.useState<File | null>(null);
   const [deletingSource, setDeletingSource] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [chatToDelete, setChatToDelete] = React.useState<ChatConversation | null>(null);
@@ -64,15 +77,30 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
     setIsDeletingChat(true);
     const deleted = await onDeleteChat(chatToDelete.conversationId);
     setIsDeletingChat(false);
-    if (deleted) setChatToDelete(null);
+    if (deleted) {
+      toast({ title: 'Chat deleted', description: `“${chatToDelete.title}” was deleted.`, variant: 'success' });
+      setChatToDelete(null);
+    } else {
+      toast({
+        title: 'Could not delete chat',
+        description: chatsError || 'Please try again.',
+        variant: 'error',
+      });
+    }
   };
 
   const refreshDocuments = React.useCallback(async () => {
     try {
       const { documents: docs } = await api.listDocuments();
       onDocumentsChange(docs);
-    } catch {
-      // Silent — the panel simply keeps its last known list.
+      return true;
+    } catch (err) {
+      setError(
+        err instanceof ApiError
+          ? `Could not refresh your PDF library: ${err.message}`
+          : 'Could not refresh your PDF library.'
+      );
+      return false;
     }
   }, [onDocumentsChange]);
 
@@ -82,9 +110,19 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
 
   const uploadFile = async (file: File) => {
     setError(null);
+    setUploadSuccess(null);
+    setFailedFile(null);
 
     if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
-      setError('Only PDF files are supported.');
+      const message = 'Only PDF files are supported.';
+      setError(message);
+      toast({ title: 'Choose a PDF file', description: message, variant: 'error' });
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      const message = 'This PDF is larger than 20MB. Choose a smaller file to upload.';
+      setError(message);
+      toast({ title: 'PDF is too large', description: message, variant: 'error' });
       return;
     }
 
@@ -93,10 +131,25 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
       await api.uploadPdf(file, {
         mode: embeddingKeyMode,
       });
-      await refreshDocuments();
+      const documentsRefreshed = await refreshDocuments();
       await onRefreshJinaApiKeys();
+      setUploadSuccess(
+        documentsRefreshed
+          ? `${file.name} is uploaded and ready to explore.`
+          : `${file.name} was uploaded, but the PDF library could not refresh.`
+      );
+      toast({
+        title: documentsRefreshed ? 'PDF uploaded' : 'PDF uploaded, library needs refresh',
+        description: documentsRefreshed
+          ? `${file.name} is ready to explore.`
+          : 'Your upload completed, but the document list could not be refreshed.',
+        variant: documentsRefreshed ? 'success' : 'info',
+      });
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Upload failed. Please try again.');
+      const message = err instanceof ApiError ? err.message : 'Upload failed. Please try again.';
+      setError(message);
+      setFailedFile(file);
+      toast({ title: 'Upload failed', description: message, variant: 'error' });
     } finally {
       setIsUploading(false);
     }
@@ -121,8 +174,11 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
     try {
       await api.deleteDocument(source);
       onDocumentsChange(documents.filter((d) => d.source !== source));
+      toast({ title: 'PDF removed', description: `${source} was removed from your library.`, variant: 'success' });
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Could not delete this document.');
+      const message = err instanceof ApiError ? err.message : 'Could not delete this document.';
+      setError(message);
+      toast({ title: 'Could not remove PDF', description: message, variant: 'error' });
     } finally {
       setDeletingSource(null);
     }
@@ -161,6 +217,7 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') inputRef.current?.click();
           }}
+          aria-busy={isUploading}
           className={cn(
             'flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed px-4 py-5 text-center transition-colors sm:py-8',
             isDragging
@@ -182,13 +239,32 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
             type="file"
             accept="application/pdf"
             className="hidden"
+            disabled={isUploading}
             onChange={handleInputChange}
           />
         </div>
-        {error && (
-          <p role="alert" className="mt-2 text-xs text-destructive">
-            {error}
+        {uploadSuccess && (
+          <p role="status" className="mt-2 flex items-start gap-1.5 text-xs text-primary">
+            <CheckCircle2 className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+            <span>{uploadSuccess}</span>
           </p>
+        )}
+        {error && (
+          <div className="mt-2 flex items-start justify-between gap-2">
+            <p role="alert" className="text-xs text-destructive">
+              {error}
+            </p>
+            {failedFile && (
+              <button
+                type="button"
+                onClick={() => void uploadFile(failedFile)}
+                disabled={isUploading}
+                className="shrink-0 rounded-md px-2 py-1 text-xs font-medium text-destructive hover:bg-destructive/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+              >
+                Retry
+              </button>
+            )}
+          </div>
         )}
       </div>
 
@@ -213,9 +289,18 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
           className="max-h-[min(35vh,16rem)] overflow-y-auto overscroll-contain pr-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           {chats.length === 0 ? (
-            <p className="px-2 py-2 text-xs text-muted-foreground">
-              Your chats will appear here after your first question.
-            </p>
+            <div className="rounded-lg bg-background/70 px-3 py-3">
+              <p className="text-xs text-muted-foreground">
+                Your conversations will appear here after your first question.
+              </p>
+              <button
+                type="button"
+                onClick={onNewChat}
+                className="mt-2 text-xs font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Start a new chat
+              </button>
+            </div>
           ) : (
             <ul className="flex flex-col gap-1">
               {chats.map((chat) => (
@@ -263,9 +348,13 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
           className="mt-1 max-h-[min(35vh,16rem)] overflow-y-auto overscroll-contain pr-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           {documents.length === 0 ? (
-            <p className="mt-6 text-center text-sm text-muted-foreground">
-              No documents yet. Upload one to get started.
-            </p>
+            <div className="mt-3 rounded-xl border border-dashed border-border bg-background/60 px-3 py-4 text-center">
+              <FileText className="mx-auto size-5 text-muted-foreground" aria-hidden="true" />
+              <p className="mt-2 text-xs font-medium">Your library is ready</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Upload a PDF above to start a conversation with your documents.
+              </p>
+            </div>
           ) : (
             <ul className="mt-4 flex flex-col gap-1.5">
               {documents.map((doc) => (

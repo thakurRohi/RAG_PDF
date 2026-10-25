@@ -11,6 +11,7 @@ import {
 } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import ThemeToggle from './theme-toggle';
+import { useToast } from './toast-provider';
 
 const JINA_INITIAL_TOKEN_BASELINE = 1_000_000;
 
@@ -47,6 +48,7 @@ export default function ProfileMenu({
   jinaKeyStatusError,
   onJinaKeyStatusErrorChange,
 }: ProfileMenuProps) {
+  const { toast } = useToast();
   const menuRef = React.useRef<HTMLDivElement>(null);
   const deleteDialogRef = React.useRef<HTMLDialogElement>(null);
   const [isOpen, setIsOpen] = React.useState(false);
@@ -89,6 +91,7 @@ export default function ProfileMenu({
       const state = await api.setActiveJinaApiKey(null);
       onJinaApiKeysChange(state);
       onEmbeddingKeyModeChange('app');
+      toast({ title: 'Using the app embedding key', variant: 'success' });
     } catch (error) {
       setMessage({
         text: error instanceof ApiError ? error.message : 'Could not select the app’s key.',
@@ -107,6 +110,7 @@ export default function ProfileMenu({
       const state = await api.setActiveJinaApiKey(keyId);
       onJinaApiKeysChange(state);
       onEmbeddingKeyModeChange('custom');
+      toast({ title: 'Embedding key updated', variant: 'success' });
     } catch (error) {
       setMessage({
         text: error instanceof ApiError ? error.message : 'Could not select this Jina key.',
@@ -145,7 +149,12 @@ export default function ProfileMenu({
       onJinaApiKeyChange('');
       setKeyLabel('');
       setShowAddKeyForm(false);
-      setMessage({ text: `“${label}” saved and verified.`, isError: false });
+      setMessage(null);
+      toast({
+        title: 'API key saved and verified',
+        description: `“${label}” is ready to use.`,
+        variant: 'success',
+      });
     } catch (error) {
       setMessage({
         text: error instanceof ApiError ? error.message : 'Could not save this Jina API key.',
@@ -166,7 +175,12 @@ export default function ProfileMenu({
       onJinaApiKeysChange(state);
       onEmbeddingKeyModeChange(state.activeKeyId ? 'custom' : 'app');
       setKeyToDelete(null);
-      setMessage({ text: `“${key.label}” deleted.`, isError: false });
+      setMessage(null);
+      toast({
+        title: 'API key deleted',
+        description: `“${key.label}” and its tracked usage were removed.`,
+        variant: 'success',
+      });
     } catch (error) {
       setMessage({
         text: error instanceof ApiError ? error.message : 'Could not delete this Jina key.',
