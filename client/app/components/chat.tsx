@@ -67,6 +67,105 @@ const SUGGESTED_QUESTIONS = [
   'What should I pay attention to?',
 ];
 
+const renderInlineMarkdown = (text: string): React.ReactNode[] =>
+  text.split(/(\*\*.+?\*\*|__.+?__|`.+?`|\*[^*\n]+\*|_[^_\n]+_)/g)
+    .filter(Boolean)
+    .map((part, index) => {
+      if ((part.startsWith('**') && part.endsWith('**')) || (part.startsWith('__') && part.endsWith('__'))) {
+        return <strong key={index}>{part.slice(2, -2)}</strong>;
+      }
+      if (part.startsWith('`') && part.endsWith('`')) {
+        return (
+          <code key={index} className="rounded bg-secondary px-1 py-0.5 font-mono text-[0.9em]">
+            {part.slice(1, -1)}
+          </code>
+        );
+      }
+      if ((part.startsWith('*') && part.endsWith('*')) || (part.startsWith('_') && part.endsWith('_'))) {
+        return <em key={index}>{part.slice(1, -1)}</em>;
+      }
+      return part;
+    });
+
+const MarkdownMessage: React.FC<{ content: string }> = ({ content }) => {
+  const blocks: React.ReactNode[] = [];
+  const lines = content.split(/\r?\n/);
+  let paragraph: string[] = [];
+  let listItems: string[] = [];
+  let listType: 'ul' | 'ol' | null = null;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    blocks.push(
+      <p key={`p-${blocks.length}`} className="mb-3 last:mb-0">
+        {renderInlineMarkdown(paragraph.join(' '))}
+      </p>
+    );
+    paragraph = [];
+  };
+
+  const flushList = () => {
+    if (!listType || !listItems.length) return;
+    const List = listType;
+    blocks.push(
+      <List
+        key={`list-${blocks.length}`}
+        className={cn(
+          'mb-3 space-y-1.5 pl-5 last:mb-0',
+          listType === 'ul' ? 'list-disc' : 'list-decimal'
+        )}
+      >
+        {listItems.map((item, index) => (
+          <li key={index} className="pl-1">
+            {renderInlineMarkdown(item)}
+          </li>
+        ))}
+      </List>
+    );
+    listItems = [];
+    listType = null;
+  };
+
+  for (const line of lines) {
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    const listItem = line.match(/^\s*(?:([-*+])|(\d+)\.)\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = heading[1].length;
+      const className = level === 1
+        ? 'mb-2 mt-4 text-lg font-semibold first:mt-0'
+        : level === 2
+          ? 'mb-2 mt-4 text-base font-semibold first:mt-0'
+          : 'mb-1.5 mt-3 text-sm font-semibold first:mt-0';
+      const headingContent = renderInlineMarkdown(heading[2]);
+      blocks.push(
+        level === 1
+          ? <h2 key={`h-${blocks.length}`} className={className}>{headingContent}</h2>
+          : level === 2
+            ? <h3 key={`h-${blocks.length}`} className={className}>{headingContent}</h3>
+            : <h4 key={`h-${blocks.length}`} className={className}>{headingContent}</h4>
+      );
+    } else if (listItem) {
+      flushParagraph();
+      const nextListType = listItem[2] ? 'ol' : 'ul';
+      if (listType && listType !== nextListType) flushList();
+      listType = nextListType;
+      listItems.push(listItem[3]);
+    } else if (!line.trim()) {
+      flushParagraph();
+      flushList();
+    } else {
+      flushList();
+      paragraph.push(line.trim());
+    }
+  }
+  flushParagraph();
+  flushList();
+
+  return <div className="break-words leading-7">{blocks}</div>;
+};
+
 const ChatComponent: React.FC<ChatComponentProps> = ({
   documents,
   embeddingKeyMode,
@@ -275,7 +374,7 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
             </h2>
             <p className="hidden truncate text-xs text-muted-foreground sm:block">
               {conversation
-                ? 'This chat only searches its selected PDFs'
+                ? 'Uses selected PDFs when relevant, plus general knowledge'
                 : 'Create a chat and choose the PDFs it can use'}
             </p>
           </div>
@@ -401,7 +500,7 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
               >
                 <div
                   className={cn(
-                    'max-w-[94%] break-words whitespace-pre-wrap rounded-2xl px-3 py-2.5 text-sm leading-relaxed sm:max-w-[90%] sm:px-4 sm:py-3',
+                    'max-w-[94%] rounded-2xl px-3 py-2.5 text-sm sm:max-w-[90%] sm:px-4 sm:py-3',
                     m.role === 'user'
                       ? 'rounded-br-sm bg-primary text-primary-foreground'
                       : m.isError
@@ -409,7 +508,9 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
                         : 'rounded-bl-sm border border-border bg-card'
                   )}
                 >
-                  {m.content}
+                  {m.role === 'assistant' && !m.isError
+                    ? <MarkdownMessage content={m.content} />
+                    : m.content}
                 </div>
                 {m.sources && m.sources.length > 0 && (
                   <div className="flex max-w-[90%] flex-wrap gap-1.5">
@@ -459,7 +560,7 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
               <div className="flex items-start">
                 <div className="flex items-center gap-2 rounded-2xl rounded-bl-sm border border-border bg-card px-3 py-2.5 text-xs text-muted-foreground sm:px-4 sm:text-sm">
                   <Loader2 className="size-3.5 animate-spin" />
-                  Searching selected PDFs…
+                  Thinking through your question…
                 </div>
               </div>
             )}

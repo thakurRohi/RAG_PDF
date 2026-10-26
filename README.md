@@ -75,6 +75,12 @@ extracted text and questions are sent to the configured providers. The service
 requires the cloud credentials above and intentionally does not fall back to
 local storage.
 
+Groq uses relevant passages from the selected PDFs as context, but can also
+answer from its general knowledge when the PDFs do not cover a question or
+only provide part of the answer. Answers distinguish PDF-supported details
+from general knowledge when useful and are formatted with Markdown for
+readability.
+
 Users sign in with Google through Supabase Auth. The server verifies Supabase
 access tokens and scopes PDF chunks, chat records, searches, and deletions to
 the authenticated user; a client-supplied user ID is never trusted. Existing
