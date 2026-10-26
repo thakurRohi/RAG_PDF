@@ -111,7 +111,6 @@ html[data-theme='light'] {
   body {
     @apply bg-background text-foreground;
     background-image: var(--page-glow);
-    background-attachment: fixed;
     transition: background-color 180ms ease, color 180ms ease;
   }
   ::selection {

@@ -33,6 +33,7 @@ interface IMessage extends ChatHistoryMessage {
 
 interface ChatComponentProps {
   documents: DocumentSummary[];
+  documentsLoaded: boolean;
   embeddingKeyMode: EmbeddingKeyMode;
   onRefreshJinaApiKeys: () => Promise<void>;
   conversation: ChatConversation | null;
@@ -87,7 +88,7 @@ const renderInlineMarkdown = (text: string): React.ReactNode[] =>
       return part;
     });
 
-const MarkdownMessage: React.FC<{ content: string }> = ({ content }) => {
+const MarkdownMessage: React.FC<{ content: string }> = React.memo(({ content }) => {
   const blocks: React.ReactNode[] = [];
   const lines = content.split(/\r?\n/);
   let paragraph: string[] = [];
@@ -164,10 +165,34 @@ const MarkdownMessage: React.FC<{ content: string }> = ({ content }) => {
   flushList();
 
   return <div className="break-words leading-7">{blocks}</div>;
-};
+});
+MarkdownMessage.displayName = 'MarkdownMessage';
+
+const ConversationSkeleton = () => (
+  <div
+    aria-label="Loading conversation"
+    aria-busy="true"
+    className="mx-auto flex w-full max-w-3xl flex-col gap-5"
+  >
+    <div className="ml-auto w-3/5 space-y-2 rounded-2xl bg-secondary/70 p-4">
+      <div className="h-3 w-full animate-pulse rounded bg-muted" />
+      <div className="h-3 w-2/3 animate-pulse rounded bg-muted" />
+    </div>
+    <div className="w-4/5 space-y-2 rounded-2xl border border-border bg-card p-4">
+      <div className="h-3 w-full animate-pulse rounded bg-muted" />
+      <div className="h-3 w-5/6 animate-pulse rounded bg-muted" />
+      <div className="h-3 w-2/3 animate-pulse rounded bg-muted" />
+    </div>
+    <div className="ml-auto w-2/5 space-y-2 rounded-2xl bg-secondary/70 p-4">
+      <div className="h-3 w-full animate-pulse rounded bg-muted" />
+      <div className="h-3 w-1/2 animate-pulse rounded bg-muted" />
+    </div>
+  </div>
+);
 
 const ChatComponent: React.FC<ChatComponentProps> = ({
   documents,
+  documentsLoaded,
   embeddingKeyMode,
   onRefreshJinaApiKeys,
   conversation,
@@ -183,18 +208,52 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
   const [selectedSources, setSelectedSources] = React.useState<string[]>([]);
   const [isHistoryLoaded, setIsHistoryLoaded] = React.useState(false);
   const [historyError, setHistoryError] = React.useState<string | null>(null);
+  const [historyLoadAttempt, setHistoryLoadAttempt] = React.useState(0);
   const [isSavingScope, setIsSavingScope] = React.useState(false);
   const [isSending, setIsSending] = React.useState(false);
   const [copiedMessageIndex, setCopiedMessageIndex] = React.useState<number | null>(null);
   const [copyErrorIndex, setCopyErrorIndex] = React.useState<number | null>(null);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const conversationId = conversation?.conversationId || null;
+  const selectedSourcesRef = React.useRef<string[]>([]);
+  const scopeSaveRef = React.useRef<{
+    conversationId: string;
+    desired: string[];
+    confirmed: string[];
+    saving: boolean;
+  } | null>(null);
+  const historyCacheRef = React.useRef(new Map<string, IMessage[]>());
+  const lastCachedConversationIdRef = React.useRef(conversationId);
   const activeConversationId = React.useRef(conversationId);
   activeConversationId.current = conversationId;
   const selectedSourcesKey = (conversation?.selectedSources || []).join('\u0000');
+  const availableSources = React.useMemo(
+    () => new Set(documents.map((document) => document.source)),
+    [documents]
+  );
+  const availableSelectedSources = selectedSources.filter((source) => availableSources.has(source));
 
   React.useEffect(() => {
-    setSelectedSources(selectedSourcesKey ? selectedSourcesKey.split('\u0000') : []);
+    const initialSources = selectedSourcesKey ? selectedSourcesKey.split('\u0000') : [];
+    const currentSave = scopeSaveRef.current;
+    if (currentSave?.conversationId === conversationId && currentSave.saving) {
+      currentSave.confirmed = initialSources;
+      return;
+    }
+
+    selectedSourcesRef.current = initialSources;
+    setSelectedSources(initialSources);
+    scopeSaveRef.current = conversationId
+      ? {
+          conversationId,
+          desired: initialSources,
+          confirmed: initialSources,
+          saving: false,
+        }
+      : null;
+  }, [conversationId, selectedSourcesKey]);
+
+  React.useEffect(() => {
     setMessages([]);
     setHistoryError(null);
     setIsHistoryLoaded(false);
@@ -203,12 +262,20 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
     setCopiedMessageIndex(null);
     setCopyErrorIndex(null);
 
-    if (!conversationId) return;
+    if (!conversationId || conversation?.isPending) return;
+    const cachedHistory = historyCacheRef.current.get(conversationId);
+    if (cachedHistory) {
+      setMessages(cachedHistory);
+      setIsHistoryLoaded(true);
+      return;
+    }
+
     let cancelled = false;
     api.getChatHistory(conversationId)
       .then(({ messages: history }) => {
         if (!cancelled) {
           setMessages(history);
+          historyCacheRef.current.set(conversationId, history);
           setIsHistoryLoaded(true);
         }
       })
@@ -225,32 +292,93 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [conversationId, selectedSourcesKey]);
+  }, [conversationId, conversation?.isPending, historyLoadAttempt]);
 
   React.useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages, isSending]);
+    if (lastCachedConversationIdRef.current !== conversationId) {
+      lastCachedConversationIdRef.current = conversationId;
+      return;
+    }
+    if (conversationId && isHistoryLoaded) {
+      historyCacheRef.current.set(conversationId, messages);
+    }
+  }, [conversationId, isHistoryLoaded, messages]);
 
-  const updateSelectedSources = async (source: string, checked: boolean) => {
-    if (!conversation || isSavingScope || isSending || conversation.hasMessages) return;
+  React.useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'auto' });
+  }, [messages]);
+
+  const updateSelectedSources = React.useCallback((source: string, checked: boolean) => {
+    if (!conversationId || isSending) return;
+    const scopeSave = scopeSaveRef.current;
+    if (!scopeSave || scopeSave.conversationId !== conversationId) return;
+
+    const currentSources = selectedSourcesRef.current.filter((item) => availableSources.has(item));
     const nextSources = checked
-      ? [...selectedSources, source]
-      : selectedSources.filter((item) => item !== source);
+      ? currentSources.includes(source) ? currentSources : [...currentSources, source]
+      : currentSources.filter((item) => item !== source);
+    selectedSourcesRef.current = nextSources;
+    scopeSave.desired = nextSources;
     setSelectedSources(nextSources);
+
+    if (scopeSave.saving) return;
+    scopeSave.saving = true;
     setIsSavingScope(true);
     setHistoryError(null);
-    try {
-      const { chat } = await api.updateChat(conversation.conversationId, nextSources);
-      onConversationChange(chat);
-    } catch (err) {
-      setSelectedSources(conversation.selectedSources);
-      const message = err instanceof ApiError ? err.message : 'Could not save this chat’s PDF scope.';
-      setHistoryError(message);
-      toast({ title: 'Could not update PDF selection', description: message, variant: 'error' });
-    } finally {
-      setIsSavingScope(false);
-    }
-  };
+
+    void (async () => {
+      try {
+        while (
+          scopeSaveRef.current === scopeSave &&
+          JSON.stringify(scopeSave.desired) !== JSON.stringify(scopeSave.confirmed)
+        ) {
+          const sourcesToSave = scopeSave.desired;
+          try {
+            const { chat } = await api.updateChat(scopeSave.conversationId, sourcesToSave);
+            scopeSave.confirmed = chat.selectedSources;
+            onConversationChange(chat);
+          } catch (err) {
+            if (JSON.stringify(scopeSave.desired) !== JSON.stringify(sourcesToSave)) continue;
+
+            scopeSave.desired = scopeSave.confirmed;
+            selectedSourcesRef.current = scopeSave.confirmed;
+            setSelectedSources(scopeSave.confirmed);
+            const errorMessage =
+              err instanceof ApiError ? err.message : 'Could not save this chat’s PDF scope.';
+            setHistoryError(errorMessage);
+            toast({
+              title: 'Could not update PDF selection',
+              description: errorMessage,
+              variant: 'error',
+            });
+            break;
+          }
+        }
+      } finally {
+        if (scopeSaveRef.current === scopeSave) {
+          scopeSave.saving = false;
+          setIsSavingScope(false);
+        }
+      }
+    })();
+  }, [
+    availableSources,
+    conversationId,
+    isSending,
+    onConversationChange,
+    toast,
+  ]);
+
+  React.useEffect(() => {
+    if (!documentsLoaded || !conversationId) return;
+    const staleSources = selectedSourcesRef.current.filter((source) => !availableSources.has(source));
+    for (const source of staleSources) updateSelectedSources(source, false);
+  }, [
+    availableSources,
+    conversationId,
+    documentsLoaded,
+    updateSelectedSources,
+  ]);
 
   const handleSendChatMessage = async (
     prompt = message,
@@ -265,7 +393,8 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
       !conversationId ||
       !currentConversation ||
       !isHistoryLoaded ||
-      !selectedSources.length
+      isSavingScope ||
+      !availableSelectedSources.length
     ) return;
 
     if (appendUserMessage) {
@@ -279,7 +408,7 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
       const data = await api.chat(trimmed, conversationId, {
         mode: embeddingKeyMode,
       });
-      await onRefreshJinaApiKeys();
+      void onRefreshJinaApiKeys();
       if (activeConversationId.current === conversationId) {
         onConversationChange({
           ...currentConversation,
@@ -381,16 +510,24 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
         </div>
         <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
           {conversation && (
-            <details className="group relative">
+            <details data-tour="pdf-scope" className="group relative">
               <summary className="flex max-w-32 cursor-pointer list-none items-center gap-1.5 rounded-md border border-border bg-card px-2 py-2 text-xs hover:bg-secondary sm:max-w-none sm:gap-2 sm:px-3 sm:text-sm">
                 <FileSearch className="size-4 text-primary" />
-                <span className="truncate">{selectedSources.length} PDFs</span>
+                <span className="truncate">{availableSelectedSources.length} PDFs</span>
                 <span className="text-muted-foreground">▾</span>
               </summary>
-              <div className="absolute right-0 z-20 mt-2 max-h-[min(70dvh,18rem)] w-[min(18rem,calc(100vw-1.5rem))] overflow-y-auto rounded-lg border border-border bg-card p-3 shadow-lg sm:max-h-72 sm:w-72">
+              <div
+                aria-busy={isSavingScope}
+                className="absolute right-0 z-20 mt-2 max-h-[min(70dvh,18rem)] w-[min(18rem,calc(100vw-1.5rem))] overflow-y-auto overscroll-contain rounded-lg border border-border bg-card p-3 shadow-lg sm:max-h-72 sm:w-72"
+              >
                 <p className="mb-2 text-xs text-muted-foreground">
-                  Only selected PDFs are searched. The scope locks after the first message.
+                  Selected PDFs are used for future questions. Earlier answers stay unchanged.
                 </p>
+                {isSavingScope && (
+                  <p role="status" className="mb-2 text-xs text-muted-foreground">
+                    Saving selection…
+                  </p>
+                )}
                 {documents.length === 0 ? (
                   <p className="py-2 text-sm text-muted-foreground">Upload PDFs in the library first.</p>
                 ) : (
@@ -400,14 +537,33 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
                         <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-2 text-sm hover:bg-secondary">
                           <input
                             type="checkbox"
-                            checked={selectedSources.includes(doc.source)}
-                            disabled={isSavingScope || isSending || conversation.hasMessages}
+                            checked={availableSelectedSources.includes(doc.source)}
+                            disabled={isSending}
                             onChange={(event) =>
                               updateSelectedSources(doc.source, event.target.checked)
                             }
-                            className="accent-primary"
+                            className="peer sr-only"
                           />
-                          <span className="min-w-0 flex-1 truncate" title={doc.source}>
+                          <span
+                            aria-hidden="true"
+                            className={cn(
+                              'flex size-4 shrink-0 items-center justify-center rounded border transition-colors peer-focus-visible:ring-2 peer-focus-visible:ring-ring',
+                              availableSelectedSources.includes(doc.source)
+                                ? 'border-primary bg-primary text-primary-foreground'
+                                : 'border-input bg-background'
+                            )}
+                          >
+                            {availableSelectedSources.includes(doc.source) && (
+                              <Check className="size-3" strokeWidth={3} />
+                            )}
+                          </span>
+                          <span
+                            className={cn(
+                              'min-w-0 flex-1 truncate',
+                              availableSelectedSources.includes(doc.source) && 'text-foreground'
+                            )}
+                            title={doc.source}
+                          >
                             {doc.source}
                           </span>
                         </label>
@@ -423,9 +579,9 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
       </header>
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-3 py-4 sm:px-6 sm:py-6">
-        {!isChatsLoaded ? (
-          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-            Loading chats…
+        {!isChatsLoaded || conversation?.isPending ? (
+          <div className="flex h-full items-center">
+            <ConversationSkeleton />
           </div>
         ) : !conversation ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center">
@@ -443,19 +599,32 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
             )}
           </div>
         ) : !isHistoryLoaded ? (
-          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-            {historyError || 'Loading conversation…'}
+          <div className="flex h-full items-center">
+            {historyError ? (
+              <div className="mx-auto text-center">
+                <p role="alert" className="text-sm text-destructive">{historyError}</p>
+                <button
+                  type="button"
+                  onClick={() => setHistoryLoadAttempt((attempt) => attempt + 1)}
+                  className="mt-2 text-sm font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Try loading again
+                </button>
+              </div>
+            ) : (
+              <ConversationSkeleton />
+            )}
           </div>
         ) : messages.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-4 px-4 py-8 text-center">
             <div className="flex size-12 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-              {selectedSources.length
+              {availableSelectedSources.length
                 ? <Sparkles className="size-5" aria-hidden="true" />
                 : <MessageCircle className="size-5" aria-hidden="true" />}
             </div>
             <div>
               <p className="text-sm font-medium">
-                {selectedSources.length
+                {availableSelectedSources.length
                   ? conversation.hasMessages
                     ? 'Ready when you are'
                     : 'What would you like to know?'
@@ -464,18 +633,18 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
                     : 'Add your first PDF'}
               </p>
               <p className="mt-1 max-w-sm text-sm text-muted-foreground">
-                {selectedSources.length
+                {availableSelectedSources.length
                   ? 'Try a question below, or write your own.'
                   : documents.length
                     ? 'Select one or more documents from the PDF menu above to get started.'
                     : 'Upload a PDF to your library, then select it here to start asking questions.'}
               </p>
             </div>
-            {!selectedSources.length && !isSidebarOpen ? (
+            {!availableSelectedSources.length && !isSidebarOpen ? (
               <Button variant="outline" size="sm" onClick={onToggleSidebar}>
                 {documents.length ? 'Open library and choose PDFs' : 'Open library to upload a PDF'}
               </Button>
-            ) : selectedSources.length ? (
+            ) : availableSelectedSources.length ? (
               <div className="flex max-w-xl flex-wrap justify-center gap-2">
                 {SUGGESTED_QUESTIONS.map((question) => (
                   <button
@@ -569,7 +738,7 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
       </div>
 
       {conversation && (
-        <div className="border-t border-border bg-card px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-6 sm:py-4">
+        <div data-tour="chat-composer" className="border-t border-border bg-card px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3 sm:px-6 sm:py-4">
           {historyError && (
             <p role="alert" className="mx-auto mb-2 max-w-3xl text-xs text-destructive">
               {historyError}
@@ -581,17 +750,17 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
               onChange={(e) => setMessage(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder={
-                selectedSources.length
+                availableSelectedSources.length
                   ? 'Message about the selected PDFs…'
                   : 'Select PDFs for this chat first…'
               }
-              disabled={!isHistoryLoaded || !selectedSources.length || isSavingScope}
+              disabled={!isHistoryLoaded || !availableSelectedSources.length || isSavingScope}
               rows={1}
               className="max-h-40 flex-1"
             />
             <Button
               onClick={() => void handleSendChatMessage()}
-              disabled={!message.trim() || isSending || !isHistoryLoaded || !selectedSources.length}
+              disabled={!message.trim() || isSending || isSavingScope || !isHistoryLoaded || !availableSelectedSources.length}
               size="icon"
               aria-label="Send message"
             >

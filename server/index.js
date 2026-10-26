@@ -1232,32 +1232,6 @@ app.patch('/chats/:conversationId', asyncHandler(async (req, res) => {
   ) {
     throw new HttpError(400, 'selectedSources must be an array of unique document names.');
   }
-  if (
-    (conversation.hasMessages || (await qdrantRequest(
-      `/collections/${encodeURIComponent(QDRANT_CHAT_COLLECTION)}/points/count`,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          exact: true,
-          filter: {
-            must: [
-              { key: 'recordType', match: { value: 'turn' } },
-              { key: 'conversationId', match: { value: conversationId } },
-              { key: 'ownerId', match: { value: req.userId } },
-            ],
-          },
-        }),
-      }
-    ))?.count > 0) &&
-    JSON.stringify([...selectedSources].sort()) !==
-      JSON.stringify([...(conversation.selectedSources || [])].sort())
-  ) {
-    throw new HttpError(
-      409,
-      'This chat’s PDF scope is locked after its first message. Create a new chat to change sources.'
-    );
-  }
-
   for (const source of selectedSources) {
     const count = await qdrantRequest(
       `/collections/${encodeURIComponent(QDRANT_COLLECTION)}/points/count`,

@@ -23,10 +23,12 @@ import { cn } from '@/lib/utils';
 
 interface LibraryPanelProps {
   documents: DocumentSummary[];
-  onDocumentsChange: (docs: DocumentSummary[]) => void;
+  onDocumentsChange: React.Dispatch<React.SetStateAction<DocumentSummary[]>>;
+  onDocumentsLoaded: () => void;
   embeddingKeyMode: EmbeddingKeyMode;
   onRefreshJinaApiKeys: () => Promise<void>;
   chats: ChatConversation[];
+  isChatsLoaded: boolean;
   activeChatId: string | null;
   chatsError: string | null;
   onSelectChat: (conversationId: string) => void;
@@ -43,9 +45,11 @@ const formatBytesFriendlyName = (name: string) => {
 const LibraryPanel: React.FC<LibraryPanelProps> = ({
   documents,
   onDocumentsChange,
+  onDocumentsLoaded,
   embeddingKeyMode,
   onRefreshJinaApiKeys,
   chats,
+  isChatsLoaded,
   activeChatId,
   chatsError,
   onSelectChat,
@@ -57,6 +61,7 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
   const inputRef = React.useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = React.useState(false);
   const [isUploading, setIsUploading] = React.useState(false);
+  const [isDocumentsLoaded, setIsDocumentsLoaded] = React.useState(false);
   const [uploadSuccess, setUploadSuccess] = React.useState<string | null>(null);
   const [failedFile, setFailedFile] = React.useState<File | null>(null);
   const [deletingSource, setDeletingSource] = React.useState<string | null>(null);
@@ -93,8 +98,12 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
     try {
       const { documents: docs } = await api.listDocuments();
       onDocumentsChange(docs);
+      setIsDocumentsLoaded(true);
+      onDocumentsLoaded();
       return true;
     } catch (err) {
+      setIsDocumentsLoaded(true);
+      onDocumentsLoaded();
       setError(
         err instanceof ApiError
           ? `Could not refresh your PDF library: ${err.message}`
@@ -102,7 +111,7 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
       );
       return false;
     }
-  }, [onDocumentsChange]);
+  }, [onDocumentsChange, onDocumentsLoaded]);
 
   React.useEffect(() => {
     refreshDocuments();
@@ -169,13 +178,25 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
   };
 
   const handleDelete = async (source: string) => {
+    if (deletingSource) return;
     setDeletingSource(source);
     setError(null);
+    const previousIndex = documents.findIndex((document) => document.source === source);
+    const deletedDocument = documents[previousIndex];
+    onDocumentsChange((current) => current.filter((document) => document.source !== source));
     try {
       await api.deleteDocument(source);
-      onDocumentsChange(documents.filter((d) => d.source !== source));
+      onDocumentsChange((current) => current.filter((document) => document.source !== source));
       toast({ title: 'PDF removed', description: `${source} was removed from your library.`, variant: 'success' });
     } catch (err) {
+      if (deletedDocument) {
+        onDocumentsChange((current) => {
+          if (current.some((document) => document.source === source)) return current;
+          const restored = [...current];
+          restored.splice(Math.min(previousIndex, restored.length), 0, deletedDocument);
+          return restored;
+        });
+      }
       const message = err instanceof ApiError ? err.message : 'Could not delete this document.';
       setError(message);
       toast({ title: 'Could not remove PDF', description: message, variant: 'error' });
@@ -205,6 +226,7 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
 
       <div className="shrink-0 px-4 sm:px-5">
         <div
+          data-tour="upload"
           onClick={() => inputRef.current?.click()}
           onDragOver={(e) => {
             e.preventDefault();
@@ -283,12 +305,19 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
           </button>
         </div>
         <div
+          data-tour="chat-history"
           role="region"
           aria-label="Chat history"
           tabIndex={0}
           className="max-h-[min(35vh,16rem)] overflow-y-auto overscroll-contain pr-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          {chats.length === 0 ? (
+          {!chats.length && !isChatsLoaded ? (
+            <div aria-label="Loading chats" aria-busy="true" className="flex flex-col gap-2 p-1">
+              {[0, 1, 2].map((item) => (
+                <div key={item} className="h-9 animate-pulse rounded-md bg-secondary/70" />
+              ))}
+            </div>
+          ) : chats.length === 0 ? (
             <div className="rounded-lg bg-background/70 px-3 py-3">
               <p className="text-xs text-muted-foreground">
                 Your conversations will appear here after your first question.
@@ -314,13 +343,18 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
                         : 'text-muted-foreground hover:bg-secondary/70 hover:text-foreground'
                     )}
                   >
-                    <MessageSquare className="size-4 shrink-0" />
-                    <span className="truncate">{chat.title}</span>
+                    {chat.isPending ? (
+                      <Loader2 className="size-4 shrink-0 animate-spin" />
+                    ) : (
+                      <MessageSquare className="size-4 shrink-0" />
+                    )}
+                    <span className="truncate">{chat.isPending ? 'Creating chat…' : chat.title}</span>
                   </button>
                   <button
                     onClick={() => setChatToDelete(chat)}
                     aria-label={`Delete chat ${chat.title}`}
                     title="Delete chat"
+                    disabled={chat.isPending}
                     className="rounded-md p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:p-1.5 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100"
                   >
                     <Trash2 className="size-3.5" />
@@ -347,7 +381,13 @@ const LibraryPanel: React.FC<LibraryPanelProps> = ({
           tabIndex={0}
           className="mt-1 max-h-[min(35vh,16rem)] overflow-y-auto overscroll-contain pr-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          {documents.length === 0 ? (
+          {!isDocumentsLoaded ? (
+            <div aria-label="Loading PDF library" aria-busy="true" className="mt-3 flex flex-col gap-2">
+              {[0, 1, 2].map((item) => (
+                <div key={item} className="h-12 animate-pulse rounded-md bg-secondary/70" />
+              ))}
+            </div>
+          ) : documents.length === 0 ? (
             <div className="mt-3 rounded-xl border border-dashed border-border bg-background/60 px-3 py-4 text-center">
               <FileText className="mx-auto size-5 text-muted-foreground" aria-hidden="true" />
               <p className="mt-2 text-xs font-medium">Your library is ready</p>

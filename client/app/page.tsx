@@ -4,6 +4,7 @@ import * as React from 'react';
 import LibraryPanel from './components/file-upload';
 import ChatComponent from './components/chat';
 import ProfileMenu from './components/profile-menu';
+import GuidedTour from './components/guided-tour';
 import {
   api,
   type ChatConversation,
@@ -14,17 +15,20 @@ import {
 import SignIn from './components/sign-in';
 import { getSupabaseClient } from '@/lib/supabase';
 import type { Session } from '@supabase/supabase-js';
+import { CircleHelp } from 'lucide-react';
 
 export default function Home() {
   const [session, setSession] = React.useState<Session | null>(null);
   const [authLoading, setAuthLoading] = React.useState(true);
   const [authError, setAuthError] = React.useState<string | null>(null);
   const [documents, setDocuments] = React.useState<DocumentSummary[]>([]);
+  const [documentsLoaded, setDocumentsLoaded] = React.useState(false);
   const [chats, setChats] = React.useState<ChatConversation[]>([]);
   const [activeChatId, setActiveChatId] = React.useState<string | null>(null);
   const [chatsLoaded, setChatsLoaded] = React.useState(false);
   const [chatsError, setChatsError] = React.useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = React.useState(false);
+  const [isGuidedTourOpen, setIsGuidedTourOpen] = React.useState(false);
   const [embeddingKeyMode, setEmbeddingKeyMode] = React.useState<EmbeddingKeyMode>('app');
   const [jinaApiKey, setJinaApiKey] = React.useState('');
   const [jinaApiKeys, setJinaApiKeys] = React.useState<JinaApiKeysState>({
@@ -39,10 +43,18 @@ export default function Home() {
   });
   const [isJinaKeyStatusLoading, setIsJinaKeyStatusLoading] = React.useState(true);
   const [jinaKeyStatusError, setJinaKeyStatusError] = React.useState<string | null>(null);
+  const handleDocumentsLoaded = React.useCallback(() => {
+    setDocumentsLoaded(true);
+  }, []);
   const chatBootstrapRef = React.useRef<{
     userId: string;
     promise: Promise<ChatConversation[]>;
   } | null>(null);
+  const isCreatingChatRef = React.useRef(false);
+  const locallyCreatedChatIdsRef = React.useRef(new Set<string>());
+  const tourStorageKey = session?.user.id
+    ? `pdf-rag-guided-tour-completed:${session.user.id}`
+    : null;
   const sessionUserId = session?.user.id ?? null;
   const activeChatStorageKey = sessionUserId
     ? `pdf-rag-active-chat-id:${sessionUserId}`
@@ -144,11 +156,15 @@ export default function Home() {
       setChatsLoaded(false);
       setChats([]);
       setDocuments([]);
+      setDocumentsLoaded(false);
       setActiveChatId(null);
       chatBootstrapRef.current = null;
       return;
     }
     let cancelled = false;
+    setChats([]);
+    setActiveChatId(null);
+    locallyCreatedChatIdsRef.current.clear();
     setChatsLoaded(false);
     setChatsError(null);
 
@@ -167,15 +183,27 @@ export default function Home() {
     bootstrap.promise
       .then((savedChats) => {
         if (cancelled) return;
-        setChats(savedChats);
+        setChats((current) => {
+          const savedChatIds = new Set(savedChats.map((chat) => chat.conversationId));
+          const localChats = current.filter(
+            (chat) => chat.isPending ||
+              !savedChatIds.has(chat.conversationId)
+          );
+          return [...localChats, ...savedChats];
+        });
         const savedActiveId = activeChatStorageKey
           ? window.localStorage.getItem(activeChatStorageKey)
           : null;
+        const pendingCreateIsActive =
+          isCreatingChatRef.current && savedActiveId?.startsWith('pending:');
+        const localChatIsActive = Boolean(
+          savedActiveId && locallyCreatedChatIdsRef.current.has(savedActiveId)
+        );
         const conversationsWithMessages = savedChats.filter((chat) => chat.hasMessages);
         const selectedChat = conversationsWithMessages.find(
           (chat) => chat.conversationId === savedActiveId
         ) || conversationsWithMessages[0] || savedChats[0];
-        if (selectedChat) {
+        if (selectedChat && !pendingCreateIsActive && !localChatIsActive) {
           setActiveChatId(selectedChat.conversationId);
           if (activeChatStorageKey) {
             window.localStorage.setItem(activeChatStorageKey, selectedChat.conversationId);
@@ -193,17 +221,81 @@ export default function Home() {
     };
   }, [sessionUserId, activeChatStorageKey]);
 
+  React.useEffect(() => {
+    if (!tourStorageKey || !chatsLoaded || !documentsLoaded) return;
+    try {
+      if (!window.localStorage.getItem(tourStorageKey)) setIsGuidedTourOpen(true);
+    } catch {
+      setIsGuidedTourOpen(true);
+    }
+  }, [tourStorageKey, chatsLoaded, documentsLoaded]);
+
+  const closeGuidedTour = React.useCallback(() => {
+    if (tourStorageKey) {
+      try {
+        window.localStorage.setItem(tourStorageKey, 'true');
+      } catch {
+        // The walkthrough remains available from Help for this session.
+      }
+    }
+    setIsGuidedTourOpen(false);
+  }, [tourStorageKey]);
+
+  const setTourSidebarOpen = React.useCallback((open: boolean) => {
+    setIsSidebarOpen(open);
+  }, []);
+
   const handleNewChat = async () => {
+    if (isCreatingChatRef.current) return;
+    isCreatingChatRef.current = true;
     setChatsError(null);
+    const previousActiveChatId = activeChatId;
+    const optimisticId = `pending:${crypto.randomUUID()}`;
+    const now = new Date().toISOString();
+    const optimisticChat: ChatConversation = {
+      conversationId: optimisticId,
+      title: 'New chat',
+      selectedSources: [],
+      hasMessages: false,
+      createdAt: now,
+      updatedAt: now,
+      isPending: true,
+    };
+    setChats((current) => [optimisticChat, ...current]);
+    setActiveChatId(optimisticId);
+    if (activeChatStorageKey) {
+      window.localStorage.setItem(activeChatStorageKey, optimisticId);
+    }
+
     try {
       const { chat } = await api.createChat();
-      setChats((current) => [chat, ...current]);
-      setActiveChatId(chat.conversationId);
-      if (activeChatStorageKey) {
+      locallyCreatedChatIdsRef.current.add(chat.conversationId);
+      setChats((current) => current.map((item) =>
+        item.conversationId === optimisticId ? chat : item
+      ));
+      if (
+        activeChatStorageKey &&
+        window.localStorage.getItem(activeChatStorageKey) === optimisticId
+      ) {
+        setActiveChatId(chat.conversationId);
         window.localStorage.setItem(activeChatStorageKey, chat.conversationId);
       }
     } catch (error) {
+      setChats((current) => current.filter((item) => item.conversationId !== optimisticId));
+      if (
+        activeChatStorageKey &&
+        window.localStorage.getItem(activeChatStorageKey) === optimisticId
+      ) {
+        if (previousActiveChatId) {
+          window.localStorage.setItem(activeChatStorageKey, previousActiveChatId);
+        } else {
+          window.localStorage.removeItem(activeChatStorageKey);
+        }
+        setActiveChatId(previousActiveChatId);
+      }
       setChatsError(error instanceof Error ? error.message : 'Could not create a chat.');
+    } finally {
+      isCreatingChatRef.current = false;
     }
   };
 
@@ -263,8 +355,16 @@ export default function Home() {
 
   if (authLoading) {
     return (
-      <main className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">
-        Checking your sign-in…
+      <main
+        aria-label="Loading your workspace"
+        aria-busy="true"
+        className="flex min-h-screen items-center justify-center px-6"
+      >
+        <div className="w-full max-w-sm space-y-4">
+          <div className="h-5 w-36 animate-pulse rounded bg-secondary" />
+          <div className="h-24 animate-pulse rounded-xl border border-border bg-card" />
+          <div className="h-10 animate-pulse rounded-lg bg-secondary/70" />
+        </div>
       </main>
     );
   }
@@ -272,7 +372,7 @@ export default function Home() {
   if (!session) return <SignIn initialError={authError} />;
 
   const activeChat = chats.find((chat) => chat.conversationId === activeChatId) || null;
-  const savedChats = chats.filter((chat) => chat.hasMessages);
+  const savedChats = chats.filter((chat) => chat.hasMessages || chat.isPending);
 
   return (
     <div className="relative flex h-dvh w-full overflow-hidden bg-background">
@@ -285,7 +385,7 @@ export default function Home() {
         />
       )}
       <div
-        className={`shrink-0 overflow-hidden transition-[width] duration-200 ease-in-out ${
+        className={`shrink-0 overflow-hidden transition-[width] duration-150 ease-in-out motion-reduce:transition-none ${
           isSidebarOpen
             ? 'fixed inset-y-0 left-0 z-40 w-[min(88vw,320px)] shadow-xl sm:relative sm:inset-auto sm:z-auto sm:w-[42vw] sm:max-w-[320px] sm:shadow-none'
             : 'fixed inset-y-0 left-0 z-40 w-0 sm:relative sm:inset-auto sm:z-auto sm:w-0 sm:max-w-0'
@@ -296,9 +396,11 @@ export default function Home() {
         <LibraryPanel
           documents={documents}
           onDocumentsChange={setDocuments}
+          onDocumentsLoaded={handleDocumentsLoaded}
           embeddingKeyMode={embeddingKeyMode}
           onRefreshJinaApiKeys={refreshJinaApiKeys}
           chats={savedChats}
+          isChatsLoaded={chatsLoaded}
           activeChatId={activeChatId}
           chatsError={chatsError}
           onSelectChat={handleSelectChat}
@@ -309,6 +411,7 @@ export default function Home() {
       </div>
       <ChatComponent
         documents={documents}
+        documentsLoaded={documentsLoaded}
         embeddingKeyMode={embeddingKeyMode}
         onRefreshJinaApiKeys={refreshJinaApiKeys}
         conversation={activeChat}
@@ -317,23 +420,40 @@ export default function Home() {
         isSidebarOpen={isSidebarOpen}
         onToggleSidebar={() => setIsSidebarOpen((open) => !open)}
         headerActions={
-          <ProfileMenu
-            userEmail={session.user.email || ''}
-            authError={authError}
-            onSignOut={handleSignOut}
-            embeddingKeyMode={embeddingKeyMode}
-            onEmbeddingKeyModeChange={setEmbeddingKeyMode}
-            jinaApiKey={jinaApiKey}
-            onJinaApiKeyChange={setJinaApiKey}
-            jinaApiKeys={jinaApiKeys.keys}
-            activeJinaKeyId={jinaApiKeys.activeKeyId}
-            appDefaultJinaUsage={jinaApiKeys.appDefaultJinaUsage}
-            onJinaApiKeysChange={handleJinaApiKeysChange}
-            isJinaKeyStatusLoading={isJinaKeyStatusLoading}
-            jinaKeyStatusError={jinaKeyStatusError}
-            onJinaKeyStatusErrorChange={setJinaKeyStatusError}
-          />
+          <>
+            <button
+              type="button"
+              onClick={() => setIsGuidedTourOpen(true)}
+              aria-label="Open app walkthrough"
+              title="App walkthrough"
+              className="inline-flex items-center gap-1.5 rounded-md px-2 py-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:px-2.5"
+            >
+              <CircleHelp className="size-4" aria-hidden="true" />
+              <span className="hidden sm:inline">Help</span>
+            </button>
+            <ProfileMenu
+              userEmail={session.user.email || ''}
+              authError={authError}
+              onSignOut={handleSignOut}
+              embeddingKeyMode={embeddingKeyMode}
+              onEmbeddingKeyModeChange={setEmbeddingKeyMode}
+              jinaApiKey={jinaApiKey}
+              onJinaApiKeyChange={setJinaApiKey}
+              jinaApiKeys={jinaApiKeys.keys}
+              activeJinaKeyId={jinaApiKeys.activeKeyId}
+              appDefaultJinaUsage={jinaApiKeys.appDefaultJinaUsage}
+              onJinaApiKeysChange={handleJinaApiKeysChange}
+              isJinaKeyStatusLoading={isJinaKeyStatusLoading}
+              jinaKeyStatusError={jinaKeyStatusError}
+              onJinaKeyStatusErrorChange={setJinaKeyStatusError}
+            />
+          </>
         }
+      />
+      <GuidedTour
+        isOpen={isGuidedTourOpen}
+        onClose={closeGuidedTour}
+        onSidebarChange={setTourSidebarOpen}
       />
     </div>
   );

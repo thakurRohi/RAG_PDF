@@ -202,6 +202,7 @@ export default function ProfileMenu({
   return (
     <div className="relative shrink-0" ref={menuRef}>
       <button
+        data-tour="profile"
         type="button"
         onClick={() => setIsOpen((open) => !open)}
         aria-label="Open profile menu"

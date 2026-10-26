@@ -107,6 +107,7 @@ export interface ChatConversation {
   hasMessages: boolean;
   createdAt: string;
   updatedAt: string;
+  isPending?: boolean;
 }
 
 export const api = {
