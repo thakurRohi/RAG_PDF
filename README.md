@@ -44,6 +44,21 @@ PDFs/chunks to local files.
    Development uses Webpack and a separate `.next-dev` output directory so
    Windows dev manifests do not contend with the production build output.
 
+## Server code layout
+
+The server is split by responsibility so routes and provider logic can be
+maintained independently:
+
+- `server/index.js` composes the app, middleware, services, and startup checks.
+- `server/config.js` loads environment configuration; `server/errors.js`
+   defines shared HTTP errors.
+- `server/infrastructure.js` contains Qdrant, Redis, cache, and encrypted
+   credential access.
+- `server/services/ai.js` handles embedding providers and grounded answer
+   generation.
+- `server/routes/` registers health, embedding-key, document, and chat
+   endpoints in separate modules.
+
 ## Deploying the client to Vercel and the server to Render
 
 - In Render, configure the web service with the repository's `server` root
