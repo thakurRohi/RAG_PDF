@@ -75,11 +75,12 @@ extracted text and questions are sent to the configured providers. The service
 requires the cloud credentials above and intentionally does not fall back to
 local storage.
 
-Groq uses relevant passages from the selected PDFs as context, but can also
-answer from its general knowledge when the PDFs do not cover a question or
-only provide part of the answer. Answers distinguish PDF-supported details
-from general knowledge when useful and are formatted with Markdown for
-readability.
+By default, Groq answers only with information supported by retrieved chunks
+from the PDFs selected for the chat. If those chunks do not contain enough
+relevant information, the answer says so and offers a **Search in full LLM
+mode** option. Choosing that option sends the question again and allows the
+answer to use general knowledge as well as the selected PDFs. The Groq API key
+is used only by the server and is never sent to the browser.
 
 Users sign in with Google through Supabase Auth. The server verifies Supabase
 access tokens and scopes PDF chunks, chat records, searches, and deletions to

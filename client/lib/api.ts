@@ -88,16 +88,22 @@ export interface ChatSource {
   snippet: string;
 }
 
+export type ChatAnswerMode = 'grounded' | 'full';
+
 export interface ChatResponse {
   message: string;
   excerpt?: string | null;
   sources: ChatSource[];
+  needsFullLlmSearch: boolean;
+  answerMode: ChatAnswerMode;
 }
 
 export interface ChatHistoryMessage {
   role: 'assistant' | 'user';
   content: string;
   sources?: ChatSource[];
+  needsFullLlmSearch?: boolean;
+  answerMode?: ChatAnswerMode;
 }
 
 export interface ChatConversation {
@@ -173,10 +179,15 @@ export const api = {
       { method: 'DELETE' }
     ),
 
-  chat: (message: string, conversationId: string, credentials: EmbeddingCredentials) =>
+  chat: (
+    message: string,
+    conversationId: string,
+    credentials: EmbeddingCredentials,
+    answerMode: ChatAnswerMode = 'grounded'
+  ) =>
     request<ChatResponse>('/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, conversationId }),
+      body: JSON.stringify({ message, conversationId, answerMode }),
     }, credentials),
 };

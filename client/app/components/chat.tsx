@@ -20,8 +20,8 @@ import {
   api,
   ApiError,
   type ChatConversation,
+  type ChatAnswerMode,
   type ChatHistoryMessage,
-  type ChatSource,
   type DocumentSummary,
   type EmbeddingKeyMode,
 } from '@/lib/api';
@@ -43,24 +43,6 @@ interface ChatComponentProps {
   onToggleSidebar: () => void;
   headerActions: React.ReactNode;
 }
-
-const SourceChip: React.FC<{ source: ChatSource }> = ({ source }) => (
-  <details className="group/source max-w-full">
-    <summary className="inline-flex max-w-full cursor-pointer list-none items-center gap-1.5 rounded-full border border-primary/20 bg-primary-soft px-2.5 py-1 font-mono text-[11px] text-primary transition-colors hover:border-primary/40 hover:bg-primary/15 [&::-webkit-details-marker]:hidden">
-      <FileSearch className="size-3 shrink-0" aria-hidden="true" />
-      <span className="truncate" title={source.source}>
-        {source.source.length > 28 ? `${source.source.slice(0, 25)}…` : source.source}
-      </span>
-      <span className="shrink-0 text-primary/60">
-        · chunk {source.chunkIndex}/{source.totalChunks}
-      </span>
-    </summary>
-    <div className="mt-2 max-w-xl rounded-xl border border-border bg-background p-3 text-xs leading-relaxed text-muted-foreground">
-      <p className="mb-1 font-medium text-foreground">{source.source}</p>
-      <p>{source.snippet || 'No excerpt is available for this source.'}</p>
-    </div>
-  </details>
-);
 
 const SUGGESTED_QUESTIONS = [
   'Summarize the key points',
@@ -383,7 +365,8 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
   const handleSendChatMessage = async (
     prompt = message,
     appendUserMessage = true,
-    retryErrorIndex?: number
+    retryErrorIndex?: number,
+    answerMode: ChatAnswerMode = 'grounded'
   ) => {
     const trimmed = prompt.trim();
     const currentConversation = conversation;
@@ -405,9 +388,12 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
     }
     setIsSending(true);
     try {
-      const data = await api.chat(trimmed, conversationId, {
-        mode: embeddingKeyMode,
-      });
+      const data = await api.chat(
+        trimmed,
+        conversationId,
+        { mode: embeddingKeyMode },
+        answerMode
+      );
       void onRefreshJinaApiKeys();
       if (activeConversationId.current === conversationId) {
         onConversationChange({
@@ -424,6 +410,8 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
             role: 'assistant',
             content: data.message,
             sources: data.sources,
+            needsFullLlmSearch: data.needsFullLlmSearch,
+            answerMode: data.answerMode,
           },
         ]);
       }
@@ -681,13 +669,33 @@ const ChatComponent: React.FC<ChatComponentProps> = ({
                     ? <MarkdownMessage content={m.content} />
                     : m.content}
                 </div>
-                {m.sources && m.sources.length > 0 && (
-                  <div className="flex max-w-[90%] flex-wrap gap-1.5">
-                    {m.sources.map((s, i) => (
-                      <SourceChip key={`${s.source}-${s.chunkIndex}-${i}`} source={s} />
-                    ))}
-                  </div>
-                )}
+                {m.role === 'assistant' && m.needsFullLlmSearch && (() => {
+                  const previousUserMessage = messages
+                    .slice(0, index)
+                    .reverse()
+                    .find((previousMessage) => previousMessage.role === 'user');
+                  return previousUserMessage ? (
+                    <div className="max-w-[90%]">
+                      <p className="mb-1 text-xs text-muted-foreground">
+                        This search may use information beyond your selected PDFs.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => void handleSendChatMessage(
+                          previousUserMessage.content,
+                          true,
+                          undefined,
+                          'full'
+                        )}
+                        disabled={isSending}
+                        className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium text-primary transition-colors hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+                      >
+                        <FileSearch className="size-3.5" aria-hidden="true" />
+                        Search in full LLM mode
+                      </button>
+                    </div>
+                  ) : null;
+                })()}
                 {m.role === 'assistant' && !m.isError && (
                   <button
                     type="button"
